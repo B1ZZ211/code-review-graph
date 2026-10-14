@@ -775,12 +775,6 @@ def test_step3_preexisting_user_config_survives(sandbox: Sandbox, key: str) -> N
 
 
 CONTENT_LEFTOVER_XFAIL = {
-    "qoder": (
-        "uninstall._process_repo removes .qoder/skills/<name>/SKILL.md only for "
-        "names found in the TARGET repo's own skills/ directory, while install "
-        "copies them out of the installed package, so every Qoder skill file "
-        "survives uninstall in a repo that has no skills/ directory of its own"
-    ),
     "gemini-cli": (
         "install_gemini_cli_hooks copies .gemini/settings.json to "
         "settings.json.bak, and uninstall never removes the backup, so a full "

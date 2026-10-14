@@ -1156,6 +1156,10 @@ NUMERIC_ENV_VARS: tuple[NumericVar, ...] = (
     NumericVar("CRG_MAX_IMPACT_DEPTH", ("status",), "3"),
     NumericVar("CRG_MAX_BFS_DEPTH", ("status",), "10"),
     NumericVar("CRG_MAX_SEARCH_RESULTS", ("status",), "15"),
+    # Parsed at import; the test-gap caller walk that ``detect-changes``
+    # runs is what reads them, so drive that command rather than ``status``.
+    NumericVar("CRG_CALLER_TEST_ROUTE_DEPTH", ("detect-changes", "--brief"), "3"),
+    NumericVar("CRG_CALLER_TEST_ROUTE_MAX_CALLERS", ("detect-changes", "--brief"), "128"),
     NumericVar("CRG_IMPACT_DEPTH_DECAY", ("status",), "0.5"),
     NumericVar("CRG_IMPACT_SCORE_FLOOR", ("status",), "0.1"),
     NumericVar("CRG_PARSE_WORKERS", ("status",), "2"),
