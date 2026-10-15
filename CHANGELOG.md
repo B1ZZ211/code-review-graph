@@ -13,12 +13,20 @@
   spelling (several names on a line, parenthesized over several lines with
   comments, `as` aliases, relative imports), packages that re-export the
   name and their `__all__`, `import module` then `module.name`, and
-  imports inside functions. JavaScript and TypeScript get the same for
-  `import { name }`, `import { name as x }`, `import * as ns`, local
-  export lists and `export { name } from` barrels. An alias keeps its own
-  name; a parameter, local, comprehension variable or class attribute that
-  reuses the name is left alone, and so are comments, strings and longer
-  names that contain it.
+  imports inside functions. Calls that no import statement names are still
+  found through the graph's call edges and resolved the same way:
+  `pkg.util.name()` after `import pkg`, `sub.util.name()` after
+  `from pkg import sub`, and a module bound by `importlib.import_module`.
+  JavaScript and TypeScript get the same for `import { name }`,
+  `import { name as x }`, local export lists, `export { name } from` and
+  `export * from` barrels (also a public barrel nothing in the repository
+  imports from), and `ns.name` through `import * as ns`, `import ns =
+  require()`, `const ns = require()`, `await import()` and
+  `import().then()`. A CommonJS `module.exports = { name }` keeps its key,
+  so its importers keep the old name. An alias keeps its own name; a
+  parameter, local, comprehension variable or class attribute that reuses
+  the name is left alone, and so are comments, strings and longer names
+  that contain it. A call inside a shell `"$(...)"` is code and is renamed.
 - Rename edits are exact. Each one carries the `column` where the old name
   starts and the `site` it is (`definition`, `call`, `reference`,
   `import`, `export`, `attribute`, `__all__`), and applying replaces the

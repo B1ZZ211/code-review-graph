@@ -393,6 +393,21 @@ def _py_module_matches(target: str, module_path: str, exact: bool) -> bool:
     return False
 
 
+def _py_module_base(dotted: str, targets: set[str]) -> Optional[str]:
+    """The directory that holds the top package of *dotted*, from the
+    files the graph resolved an import of it to (``/repo`` for
+    ``pkg.util`` resolved to ``/repo/pkg/util.py``)."""
+    rel = "/" + dotted.replace(".", "/")
+    for target in sorted(targets):
+        for ending in ("/__init__.py", "/__init__.pyi", ".py", ".pyi", ".pyw"):
+            if target.endswith(ending):
+                module = target[: -len(ending)]
+                if module.endswith(rel):
+                    return module[: -len(rel)]
+                break
+    return None
+
+
 def _dotted(expr: ast.expr) -> Optional[str]:
     """``a.b.c`` for a Name/Attribute chain, else ``None``."""
     parts: list[str] = []
@@ -441,6 +456,10 @@ class _PyRenameScan:
         self.fixed: list[_Occurrence] = []
         self.attributes: list[ast.Attribute] = []
         self.module_prefixes: set[str] = set()
+        # Names bound to a module, by the module's path without its ending
+        # (``pkg`` -> ``/repo/pkg`` after ``import pkg``), so that
+        # ``pkg.util.name`` is followed to ``/repo/pkg/util.py``.
+        self.module_paths: dict[str, str] = {}
         self.all_entries: list[ast.Constant] = []
         self.called: set[int] = set()  # ids of Name nodes that are called
 
@@ -468,13 +487,27 @@ class _PyRenameScan:
                 if col is not None:
                     found.append((const.lineno, col, "__all__", None))
         for attr in self.attributes:
-            if _dotted(attr.value) in self.module_prefixes and attr.end_lineno is not None:
+            if self._names_exporter(_dotted(attr.value)) and attr.end_lineno is not None:
                 line = attr.end_lineno
                 end = attr.end_col_offset or 0
                 found.append(
                     (line, self.src.char_col(line, end - self.name_bytes), "attribute", None)
                 )
         return found, root.target
+
+    def _names_exporter(self, dotted: Optional[str]) -> bool:
+        """Whether ``dotted`` is a module that exports the symbol."""
+        if dotted is None:
+            return False
+        if dotted in self.module_prefixes:
+            return True
+        root, _, rest = dotted.partition(".")
+        path = self.module_paths.get(root)
+        if path is None:
+            return False
+        if rest:
+            path = f"{path}/{rest.replace('.', '/')}"
+        return any(_py_module_matches(e, path, True) for e in self.exporters)
 
     def _owner(self, scope: _PyScope) -> _PyScope:
         """The scope whose binding an occurrence in *scope* refers to."""
@@ -578,6 +611,8 @@ class _PyRenameScan:
                     scope = scope.outside_class()
                 self._use(scope, node.lineno, node.col_offset, site)
         elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            if isinstance(node, ast.Assign):
+                self._bind_import_module(node)
             # Evaluation order: the value runs before the target is bound.
             if isinstance(node, ast.AnnAssign):
                 self._visit(node.annotation, scope)
@@ -632,6 +667,22 @@ class _PyRenameScan:
                     scope.bind()
             for child in ast.iter_child_nodes(node):
                 self._visit(child, scope)
+
+    def _bind_import_module(self, node: ast.Assign) -> None:
+        """``mod = importlib.import_module("pkg.util")`` binds a module."""
+        call = node.value
+        if not (
+            len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and isinstance(call, ast.Call) and len(call.args) == 1 and not call.keywords
+            and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+            and _dotted(call.func) in ("importlib.import_module", "import_module")
+        ):
+            return
+        module_path = call.args[0].value.replace(".", "/")
+        if not module_path.startswith("/") and any(
+            _py_module_matches(e, module_path, False) for e in self.exporters
+        ):
+            self.module_prefixes.add(node.targets[0].id)
 
     def _visit_function(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], scope: _PyScope,
@@ -729,6 +780,10 @@ class _PyRenameScan:
             ):
                 self.module_prefixes.add(alias.asname or alias.name)
             bound = alias.asname or alias.name.split(".", 1)[0]
+            base = _py_module_base(alias.name, targets)
+            if base is not None:
+                module = alias.name if alias.asname else bound
+                self.module_paths[bound] = f"{base}/{module.replace('.', '/')}"
             if bound == self.name:
                 scope.bind()
                 if alias.asname is not None:
@@ -758,6 +813,13 @@ class _PyRenameScan:
                 if not any(submodule_of(t, alias.name) for alias in node.names)
             }
         from_exporter = bool(module_targets & self.exporters)
+        absolute: Optional[str] = module_path if exact else None
+        if not exact and node.module:
+            for dotted in [node.module, *(f"{node.module}.{a.name}" for a in node.names)]:
+                top = _py_module_base(dotted, targets)
+                if top is not None:
+                    absolute = f"{top}/{module_path}"
+                    break
 
         for alias in node.names:
             if alias.name == "*":
@@ -765,6 +827,9 @@ class _PyRenameScan:
                     scope.star = True
                 continue
             bound = alias.asname or alias.name
+            if absolute is not None:
+                # ``from pkg import sub`` then ``sub.util.name``.
+                self.module_paths[bound] = f"{absolute}/{alias.name}"
             if any(submodule_of(t, alias.name) for t in targets & self.exporters):
                 # ``from pkg import util``: a module whose attribute is renamed.
                 self.module_prefixes.add(bound)
@@ -812,16 +877,19 @@ def _py_find_definition(
 
 
 def _python_rename_sites(
-    store: GraphStore, node: GraphNode, sources: _Sources,
+    store: GraphStore, node: GraphNode, sources: _Sources, call_files: set[str],
 ) -> Optional[dict[str, list[_Occurrence]]]:
     """Exact sites for a Python function or class reached by its name.
 
     Covers the defining module and, for a module-level symbol, every module
     that imports it -- directly, through a package that re-exports it, or
-    through ``import module`` and attribute access. Returns ``None`` when
-    the symbol is a method (reached as an attribute, so only the graph's
-    call sites can find it) or the source cannot be parsed; the caller then
-    falls back to the graph.
+    through ``import module`` and attribute access -- and every module in
+    *call_files* (those with a call edge to the bare name), where a call
+    such as ``pkg.util.name()`` after ``import pkg``, or through a module
+    bound by ``importlib``, reaches it without an import that names it.
+    Returns ``None`` when the symbol is a method (reached as an attribute,
+    so only the graph's call sites can find it) or the source cannot be
+    parsed; the caller then falls back to the graph.
     """
     name = node.name
     home = node.file_path
@@ -861,12 +929,17 @@ def _python_rename_sites(
         # A nested function is invisible outside its module.
         return results if home in results else None
 
-    pending = deque(_importer_files(store, home))
-    pending.extend(
-        edge.file_path for edge in store.get_edges_by_target(node.qualified_name)
-        if edge.kind == "IMPORTS_FROM"
-    )
-    queued = set(pending)
+    pending: deque[str] = deque()
+    queued: set[str] = set()
+    for path in [
+        *_importer_files(store, home),
+        *(edge.file_path for edge in store.get_edges_by_target(node.qualified_name)
+          if edge.kind == "IMPORTS_FROM"),
+        *sorted(call_files),
+    ]:
+        if path not in queued:
+            queued.add(path)
+            pending.append(path)
     while pending:
         path = pending.popleft()
         queued.discard(path)
@@ -905,6 +978,20 @@ def _ts_same(a: Any, b: Any) -> bool:
 def _ts_string_value(node: Any) -> str:
     text = _ts_text(node)
     return text[1:-1] if len(text) >= 2 and text[0] in "'\"`" else text
+
+
+def _js_module_call_spec(node: Any) -> Any:
+    """The specifier string of ``import('./m')`` or ``require('./m')``."""
+    if node is None or node.type != "call_expression":
+        return None
+    func = node.child_by_field_name("function")
+    if func is None or not (
+        func.type == "import" or (func.type == "identifier" and _ts_text(func) == "require")
+    ):
+        return None
+    args = node.child_by_field_name("arguments")
+    first = args.named_children[0] if args is not None and args.named_children else None
+    return first if first is not None and first.type == "string" else None
 
 
 def _js_is_declaration(leaf: Any) -> bool:
@@ -996,12 +1083,19 @@ class _JsScan:
         self.kept: set[tuple[int, int]] = set()
         # Declaration ranges: (start byte, end byte, is the renamed symbol).
         self.scopes: list[tuple[int, int, bool]] = []
-        self.members: list[tuple[str, Any]] = []
-        self.prefixes: set[str] = set()
+        # ``obj.name`` uses: (obj, obj's start byte, the name's leaf).
+        self.members: list[tuple[str, int, Any]] = []
+        # Names bound to an exporting module's namespace, and the byte
+        # ranges they are bound in.
+        self.prefixes: dict[str, list[tuple[int, int]]] = {}
         self.barrels: set[str] = set()
         self.reexports = False      # ``export { name } from`` an exporter
         self.local_export = False   # ``export { name }`` of the symbol
         self.found_definition = False
+        # ``export function name``: the module exports the symbol under its
+        # name (a default export is ``default``, whatever it is called).
+        self.exported_definition = False
+        self.commonjs = False  # ``module.exports`` or ``exports.x`` appears
         self.root: Any = None
 
     def occurrence(self, leaf: Any, site: str, new: Optional[str] = None) -> _Occurrence:
@@ -1033,6 +1127,10 @@ class _JsScan:
             if kind == "export_statement" and current.child_by_field_name("source") is not None:
                 self.visit_reexport(current)
                 continue
+            if kind == "variable_declarator":
+                self.visit_module_value(current)
+            elif kind == "call_expression":
+                self.visit_import_then(current)
             if kind in ("member_expression", "nested_identifier"):
                 obj = current.child_by_field_name("object")
                 prop = current.child_by_field_name("property")
@@ -1040,7 +1138,12 @@ class _JsScan:
                     obj, prop = current.named_children
                 if prop is not None and obj is not None:
                     if obj.type == "identifier" and _ts_text(prop) == self.name:
-                        self.members.append((_ts_text(obj), prop))
+                        self.members.append((_ts_text(obj), obj.start_byte, prop))
+                    if obj.type == "identifier" and (
+                        _ts_text(obj) == "exports"
+                        or (_ts_text(obj) == "module" and _ts_text(prop) == "exports")
+                    ):
+                        self.commonjs = True
                     # ``x.name`` is a property of x, never the binding.
                     stack.append(obj)
                     continue
@@ -1048,10 +1151,12 @@ class _JsScan:
                 if kind in _JS_NAME_LEAVES and _ts_text(current) == self.name:
                     self.visit_name(current)
                 continue
-            stack.extend(current.children)
+            # Source order: the definition is the first declaration of the
+            # name in its line window, before any local that reuses it.
+            stack.extend(reversed(current.children))
 
-        for obj_name, prop in self.members:
-            if obj_name in self.prefixes:
+        for obj_name, obj_start, prop in self.members:
+            if any(s <= obj_start < e for s, e in self.prefixes.get(obj_name, ())):
                 self.renames.append(self.occurrence(prop, "attribute"))
         for occurrence, start, end, exported in self.plain:
             resolved = self.resolves_to_symbol(start, end)
@@ -1085,8 +1190,19 @@ class _JsScan:
         return self.bound
 
     @property
+    def exports_by_name(self) -> bool:
+        """An ES module export of the symbol under its own name."""
+        return self.reexports or self.local_export or self.exported_definition
+
+    @property
     def exports(self) -> bool:
-        return self.reexports or self.local_export
+        """Importers of this module name the symbol as the rename changes it.
+
+        A CommonJS home keeps its key (``module.exports = { name: new }``),
+        so its importers keep the old name; any other home is taken to
+        export the name, as an import of it would be an error otherwise.
+        """
+        return self.exports_by_name or (self.def_lines is not None and not self.commonjs)
 
     def visit_name(self, leaf: Any) -> None:
         if _js_is_declaration(leaf):
@@ -1097,6 +1213,10 @@ class _JsScan:
             )
             if is_target:
                 self.found_definition = True
+                export = _ts_ancestor(leaf, frozenset({"export_statement"}))
+                self.exported_definition = export.type == "export_statement" and not any(
+                    c.type == "default" for c in export.children
+                )
                 self.renames.append(self.occurrence(leaf, "definition"))
             self.declare(_js_declaration_scope(leaf), is_target)
             return
@@ -1118,9 +1238,82 @@ class _JsScan:
             (self.occurrence(leaf, site, replacement), leaf.start_byte, leaf.end_byte, exported)
         )
 
+    def namespace(self, ident: Any, targets: set[str], scope: Any) -> None:
+        """Bind *ident* to a module namespace within *scope*.
+
+        A module that is not (yet) known to export the symbol is a barrel
+        candidate: if it turns out to re-export it, this file is scanned
+        again and ``ident.name`` is renamed then.
+        """
+        if targets & self.exporters:
+            self.prefixes.setdefault(_ts_text(ident), []).append(
+                (scope.start_byte, scope.end_byte)
+            )
+        else:
+            self.barrels.update(targets)
+
+    def module_targets(self, spec: Any) -> set[str]:
+        """Files a module specifier (a string node) resolves to."""
+        if spec is None:
+            return set()
+        resolved = self.resolve(_ts_string_value(spec))
+        if resolved:
+            return {resolved}
+        return set(self.import_targets.get(spec.start_point[0] + 1, set()))
+
+    def visit_module_value(self, declarator: Any) -> None:
+        """``const ns = await import('./m')`` or ``const ns = require('./m')``."""
+        ident = declarator.child_by_field_name("name")
+        value = declarator.child_by_field_name("value")
+        if ident is None or ident.type != "identifier" or value is None:
+            return
+        if value.type == "await_expression" and value.named_child_count == 1:
+            value = value.named_children[0]
+        spec = _js_module_call_spec(value)
+        if spec is not None:
+            self.namespace(ident, self.module_targets(spec), _js_declaration_scope(ident))
+
+    def visit_import_then(self, call: Any) -> None:
+        """``import('./m').then((ns) => ns.name())``."""
+        func = call.child_by_field_name("function")
+        if func is None or func.type != "member_expression":
+            return
+        prop = func.child_by_field_name("property")
+        spec = _js_module_call_spec(func.child_by_field_name("object"))
+        args = call.child_by_field_name("arguments")
+        if spec is None or _ts_text(prop) != "then" or args is None or not args.named_children:
+            return
+        callback = args.named_children[0]
+        if callback.type not in ("arrow_function", "function_expression", "function"):
+            return
+        param = callback.child_by_field_name("parameter")
+        if param is None:
+            params = callback.child_by_field_name("parameters")
+            first = (
+                params.named_children[0]
+                if params is not None and params.named_children else None
+            )
+            if first is not None and first.type in ("required_parameter", "optional_parameter"):
+                first = first.child_by_field_name("pattern")
+            param = first
+        if param is not None and param.type == "identifier":
+            self.namespace(param, self.module_targets(spec), callback)
+
     def visit_import(self, statement: Any) -> None:
         targets = self.statement_targets(statement)
         from_exporter = bool(targets & self.exporters)
+        require = next(
+            (c for c in statement.children if c.type == "import_require_clause"), None,
+        )
+        if require is not None:
+            # TypeScript ``import ns = require('./m')``.
+            ident = next((c for c in require.children if c.type == "identifier"), None)
+            if ident is not None:
+                spec = require.child_by_field_name("source")
+                self.namespace(ident, targets or self.module_targets(spec), self.root)
+                if _ts_text(ident) == self.name:
+                    self.declare(self.root, False)
+            return
         clause = next((c for c in statement.children if c.type == "import_clause"), None)
         if clause is None:
             return
@@ -1131,8 +1324,7 @@ class _JsScan:
             elif part.type == "namespace_import":
                 ident = next((c for c in part.children if c.type == "identifier"), None)
                 if ident is not None:
-                    if from_exporter:
-                        self.prefixes.add(_ts_text(ident))
+                    self.namespace(ident, targets, self.root)
                     if _ts_text(ident) == self.name:
                         self.declare(self.root, False)
             elif part.type == "named_imports":
@@ -1161,9 +1353,16 @@ class _JsScan:
 
     def visit_reexport(self, statement: Any) -> None:
         targets = self.statement_targets(statement)
-        if not targets & self.exporters:
-            return
         clause = next((c for c in statement.children if c.type == "export_clause"), None)
+        if not targets & self.exporters:
+            # A barrel re-exporting another barrel: once that one is known
+            # to export the symbol, this file is scanned again.
+            if clause is None or any(
+                _ts_text(spec.child_by_field_name("name")) == self.name
+                for spec in clause.children if spec.type == "export_specifier"
+            ):
+                self.barrels.update(targets)
+            return
         if clause is None:
             if any(c.type == "*" for c in statement.children) and not any(
                 c.type == "namespace_export" for c in statement.children
@@ -1185,6 +1384,33 @@ class _JsScan:
                 self.renames.append(self.occurrence(alias, "export"))
 
 
+def _js_reexport_files(
+    store: GraphStore, sources: _Sources, name: str, home: str,
+) -> list[str]:
+    """JS/TS files that spell ``export { name } from``.
+
+    A re-export carries no graph edge, so a barrel that no file imports
+    the name from by name (a package's public ``index.ts``) is found only
+    by reading the files.
+    """
+    marker = name.encode("utf-8")
+    pattern = re.compile(
+        rb"\bexport\s+(?:type\s+)?\{[^}]*?(?<![\w$])" + re.escape(marker)
+        + rb"(?![\w$])[^}]*\}\s*from\b"
+    )
+    found = []
+    for path in store.get_all_files():
+        if path == home or sources.language(path) not in _JS_FAMILY:
+            continue
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            continue
+        if marker in data and pattern.search(data):
+            found.append(path)
+    return sorted(found)
+
+
 def _js_rename_sites(
     store: GraphStore,
     node: GraphNode,
@@ -1195,16 +1421,23 @@ def _js_rename_sites(
     """Exact sites for a top-level JS/TS symbol.
 
     Follows named imports (``import { name }``, ``import { name as x }``),
-    namespace imports (``import * as ns`` then ``ns.name``), local export
-    lists and re-exporting barrels (``export { name } from``,
-    ``export * from``). Barrels carry no import edge, so they are found
-    from the consumers whose calls the graph resolved through them.
+    namespace objects (``import * as ns``, ``import ns = require()``,
+    ``const ns = require()``, ``await import()`` and ``import().then``,
+    then ``ns.name``), local export lists and re-exporting barrels
+    (``export { name } from``, ``export * from``). Re-exports carry no
+    import edge, so barrels are found from the consumers that import
+    through them and, for an exported symbol, by reading the files that
+    spell ``export { name } from``. *graph_files* are the files with a call
+    edge to the name; they are scanned too, so a namespace object there is
+    followed.
     """
     home = node.file_path
     if sources.tree(home) is None or sources.get(home) is None:
         return None
     window = range(node.line_start, min(node.line_end, node.line_start + _DEF_SEARCH_LINES) + 1)
-    exporters = {home}
+    # Modules whose export of the name the rename changes; the home module
+    # joins once its scan shows it is not CommonJS.
+    exporters: set[str] = set()
     results: dict[str, _JsScan] = {}
     pending: deque[str] = deque([home])
     queued = {home}
@@ -1235,8 +1468,11 @@ def _js_rename_sites(
         )
         scan.run(tree.root_node)
         results[path] = scan
-        if path == home and not scan.found_definition:
-            return None
+        if path == home:
+            if not scan.found_definition:
+                return None
+            if scan.exports_by_name:
+                enqueue(_js_reexport_files(store, sources, node.name, home))
         if scan.exports and path not in exporters:
             exporters.add(path)
             enqueue(_importer_files(store, path))
@@ -1273,10 +1509,17 @@ def _ts_call_row(leaf: Any) -> Optional[int]:
 
 
 def _ts_in_comment_or_string(tree: Any, row: int, start: int, end: int) -> bool:
-    """Whether bytes ``start:end`` of *row* lie in a comment or a string."""
+    """Whether bytes ``start:end`` of *row* lie in a comment or a string.
+
+    Code embedded in a string (``"$(name)"`` in a shell script, ``"#{name}"``)
+    is code: the walk stops at the substitution or interpolation.
+    """
     current = tree.root_node.descendant_for_point_range((row, start), (row, end))
     while current is not None:
-        if "comment" in current.type or "string" in current.type:
+        kind = current.type
+        if "substitution" in kind or "interpolation" in kind:
+            return False
+        if "comment" in kind or "string" in kind:
             return True
         current = current.parent
     return False
@@ -1510,37 +1753,38 @@ def _rename_edits(
     # Places a scan resolved to another binding of the name.
     kept: dict[str, set[tuple[int, int]]] = {}
     member = bool(node.parent_name)
-    python_module_symbol = False
     js_module_symbol = False
-
-    if language == "python":
-        python_sites = _python_rename_sites(store, node, sources)
-        if python_sites is not None:
-            python_module_symbol = True
-            exact.update(python_sites)
-            authoritative.update(python_sites)
-    elif language in _JS_FAMILY and not member:
-        scans = _js_rename_sites(store, node, new_name, sources, resolved_files)
-        if scans is not None:
-            js_module_symbol = True
-            for path, scan in scans.items():
-                exact[path] = scan.renames
-                kept[path] = scan.kept
-                if scan.authoritative:
-                    authoritative.add(path)
-
     # A bare-name CALLS edge is a guess about which same-named symbol a
-    # call means. Python's resolved imports make the guess unnecessary for a
-    # module-level symbol; elsewhere it is the only evidence there is.
-    if not python_module_symbol:
-        bare_edges = store.search_edges_by_target_name(
-            name, kind="CALLS", language=language or None,
-        )
+    # call means, but it is the only evidence for a call no import spells.
+    bare_edges = store.search_edges_by_target_name(
+        name, kind="CALLS", language=language or None,
+    )
+    bare_files = {edge.file_path for edge in bare_edges}
+    python_sites = (
+        _python_rename_sites(store, node, sources, bare_files)
+        if language == "python" else None
+    )
+
+    if python_sites is not None:
+        # The scan read the modules with a call edge to the name as well as
+        # those that import it, and resolved each use by scope.
+        exact.update(python_sites)
+        authoritative.update(python_sites)
+    else:
         for edge in bare_edges:
             note(edge.file_path, edge.line, "call")
+        if language in _JS_FAMILY and not member:
+            scans = _js_rename_sites(store, node, new_name, sources, resolved_files | bare_files)
+            if scans is not None:
+                js_module_symbol = True
+                for path, scan in scans.items():
+                    exact[path] = scan.renames
+                    kept[path] = scan.kept
+                    if scan.authoritative:
+                        authoritative.add(path)
 
     # A Python method is only ever reached as ``something.name``; a JS/TS
-    # module-level symbol never is, except through the namespace imports
+    # module-level symbol never is, except through the namespace objects
     # the scan already followed.
     mode = "any"
     if language == "python" and member:
