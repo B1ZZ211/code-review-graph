@@ -11673,6 +11673,12 @@ class CodeParser:
         # Tree-sitter maps struct/enum/actor/extension all to class_declaration;
         # protocol uses its own protocol_declaration node type.
         extra: dict = {}
+        # TypeScript interfaces and type aliases share kind Class but have no
+        # runtime body, so changes.py must not report them as test gaps (#1109).
+        if language in ("typescript", "tsx") and child.type in (
+            "interface_declaration", "type_alias_declaration",
+        ):
+            extra["typescript_kind"] = child.type
         if language == "swift":
             if child.type == "class_declaration":
                 _swift_keywords = {"class", "struct", "enum", "actor", "extension"}
