@@ -154,7 +154,8 @@ def test_powershell_commands_reach_call_extraction(tmp_path, monkeypatch):
     assert any(n.kind == "File" for n in nodes)
 
 
-def test_powershell_call_dispatch_scales_to_many_commands(tmp_path, monkeypatch):
+def test_powershell_long_script_dispatches_every_command(tmp_path, monkeypatch):
+    """A flat 2,000-command script: none is skipped by call dispatch."""
     seen = _spy_call_dispatch(monkeypatch)
     count = 2000
     path = tmp_path / "many.ps1"
@@ -240,7 +241,80 @@ def test_swift_struct_and_ruby_receiver_calls_still_extracted(tmp_path):
     assert {"new", "run"} <= targets
 
 
-def test_powershell_call_dispatch_names_the_command_node():
-    """Pins the rename itself; the contract above would also accept a table
-    that dropped PowerShell calls entirely."""
-    assert _CALL_TYPES["powershell"] == ["command"]
+_PS_PIPELINE_SOURCE = """\
+class Widget {
+    [void] Run() { Write-Host "hi" }
+}
+Get-ChildItem -Path . | Where-Object { Test-Path $_ } | Sort-Object Name
+"""
+
+
+def test_powershell_pipeline_stages_and_class_methods_reach_call_extraction(
+    tmp_path, monkeypatch,
+):
+    """Every stage of a pipeline is its own ``command`` node, as is a command
+    in a class method body; each one must reach call extraction."""
+    seen = _spy_call_dispatch(monkeypatch)
+    path = tmp_path / "pipeline.ps1"
+    path.write_text(_PS_PIPELINE_SOURCE, encoding="utf-8")
+
+    CodeParser().parse_file(path)
+
+    heads = sorted(text.split()[0] for _, text in seen)
+    assert heads == [
+        "Get-ChildItem", "Sort-Object", "Test-Path", "Where-Object", "Write-Host",
+    ]
+
+
+def test_powershell_module_file_dispatches_calls(tmp_path, monkeypatch):
+    """``.psm1`` modules are PowerShell too and take the same call dispatch."""
+    seen = _spy_call_dispatch(monkeypatch)
+    path = tmp_path / "Tools.psm1"
+    path.write_text(
+        "function Get-Foo { Write-Verbose 'x' }\n"
+        "Export-ModuleMember -Function Get-Foo\n",
+        encoding="utf-8",
+    )
+
+    CodeParser().parse_file(path)
+
+    heads = sorted(text.split()[0] for _, text in seen)
+    assert heads == ["Export-ModuleMember", "Write-Verbose"]
+
+
+def test_powershell_half_written_script_still_parses(tmp_path, monkeypatch):
+    """An unfinished script (unclosed function, dangling pipe) sends its
+    recovered commands through call extraction without raising."""
+    seen = _spy_call_dispatch(monkeypatch)
+    path = tmp_path / "wip.ps1"
+    path.write_text(
+        'Write-Output "before"\nfunction Broken {\n    Get-Item $x |\n',
+        encoding="utf-8",
+    )
+
+    nodes, _edges = CodeParser().parse_file(path)
+
+    assert any(n.kind == "File" for n in nodes)
+    assert {kind for kind, _ in seen} == {"command"}
+    assert "Write-Output" in {text.split()[0] for _, text in seen}
+
+
+def test_objc_interface_only_category_is_a_class(tmp_path):
+    """The construct ``category_interface`` was meant for: a category declared
+    with ``@interface`` and no ``@implementation`` in the file. It parses as
+    ``class_interface``, which alone must still yield the Class node."""
+    path = tmp_path / "Widget+Private.m"
+    path.write_text(
+        "@interface Widget (Private)\n"
+        "- (void)reset;\n"
+        "@end\n",
+        encoding="utf-8",
+    )
+
+    nodes, edges = CodeParser().parse_file(path)
+
+    widget = [n for n in nodes if n.kind == "Class" and n.name == "Widget"]
+    assert len(widget) == 1 and widget[0].line_start == 1
+    assert any(
+        e.kind == "CONTAINS" and e.target.endswith("::Widget") for e in edges
+    )
