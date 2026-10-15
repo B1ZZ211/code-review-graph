@@ -407,3 +407,153 @@ class TestRealEntryPoints:
         assert hasattr(crg_main, "embed_graph_tool")
         args = cli.build_parser().parse_args(["embed"])
         assert args.command == "embed"
+
+
+def _notices(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage() == REFRESH_SKIPPED_WARNING]
+
+
+class TestWatchTellsTheUser:
+    """Watch drops the notice from its failure check, so the log is all the user sees."""
+
+    def test_every_watch_update_logs_the_notice_once_and_keeps_running(
+        self, tmp_path, caplog,
+    ):
+        from functools import partial
+
+        from watchdog.events import FileCreatedEvent
+
+        from code_review_graph.incremental import _create_watch_handler
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        store = GraphStore(tmp_path / "graph.db")
+        # The exact callback ``code-review-graph watch`` builds for the pair.
+        handler = _create_watch_handler(repo, store, partial(run_post_processing, **PAIR))
+        caplog.set_level(logging.WARNING)
+        try:
+            with patch("code_review_graph.embeddings.get_provider") as get_provider:
+                for name in ("first.py", "second.py"):
+                    source = repo / name
+                    source.write_text(f"def {source.stem}():\n    pass\n")
+                    caplog.clear()
+                    handler.process([FileCreatedEvent(str(source))])
+                    handler.raise_if_failed()
+                    assert len(_notices(caplog)) == 1, name
+            get_provider.assert_not_called()
+            assert len(store.get_all_files()) == 2
+            assert not has_embeddings(store)
+        finally:
+            store.close()
+
+    def test_cli_watch_with_the_pair_keeps_running_on_a_never_embedded_graph(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        from code_review_graph import cli
+
+        repo = _git_repo(tmp_path, monkeypatch)
+        build_or_update_graph(full_rebuild=True, repo_root=str(repo))
+        # Changed while no watcher ran: startup reconciliation re-parses it and
+        # hands the store to the CLI's post-processing callback.
+        (repo / "app.py").unlink()
+        argv = [
+            "code-review-graph", "watch", "--repo", str(repo),
+            "--embedding-provider", "local", "--embedding-model", "test-model",
+        ]
+        caplog.set_level(logging.WARNING)
+        with (
+            patch.object(sys, "argv", argv),
+            patch("code_review_graph.embeddings.get_provider") as get_provider,
+            patch("watchdog.observers.Observer") as observer,
+            patch("time.sleep", side_effect=KeyboardInterrupt),
+        ):
+            cli.main()  # a fatal post-processing warning would sys.exit(1)
+        get_provider.assert_not_called()
+        observer.return_value.start.assert_called_once()
+        assert len(_notices(caplog)) == 1
+        assert not _embeddings_table_exists(repo)
+
+
+class TestNoChangeUpdateEdgeCases:
+    def test_an_empty_table_left_by_graph_stats_is_still_a_skip(self, tmp_path, monkeypatch):
+        """``list_graph_stats`` opens an EmbeddingStore, which creates an empty table."""
+        from code_review_graph.tools.query import list_graph_stats
+
+        repo = _git_repo(tmp_path, monkeypatch)
+        build_or_update_graph(full_rebuild=True, repo_root=str(repo))
+        with patch("code_review_graph.embeddings.get_provider", return_value=None):
+            stats = list_graph_stats(repo_root=str(repo))
+        assert stats["status"] == "ok"
+        assert _embeddings_table_exists(repo)
+
+        with patch("code_review_graph.embeddings.get_provider") as get_provider:
+            result = build_or_update_graph(repo_root=str(repo), **PAIR)
+        get_provider.assert_not_called()
+        assert result["files_updated"] == 0
+        _assert_skip_reported(result)
+
+    @pytest.mark.parametrize("changed", [False, True], ids=["no-op", "reparse"])
+    @pytest.mark.parametrize(
+        "half",
+        [{"embedding_provider": "local"}, {"embedding_model": "test-model"}],
+        ids=["provider-only", "model-only"],
+    )
+    def test_half_a_pair_is_never_reported_as_a_skip(
+        self, tmp_path, monkeypatch, changed, half,
+    ):
+        """MCP callers can send half a pair; the CLI rejects it before this point."""
+        repo = _git_repo(tmp_path, monkeypatch)
+        build_or_update_graph(full_rebuild=True, repo_root=str(repo))
+        if changed:
+            _commit_change(repo)
+
+        with patch("code_review_graph.embeddings.get_provider") as get_provider:
+            result = build_or_update_graph(repo_root=str(repo), **half)
+        get_provider.assert_not_called()
+        assert result["status"] == "ok"
+        assert "embeddings_refresh_skipped" not in result
+        assert REFRESH_SKIPPED_WARNING not in result.get("warnings", [])
+
+
+class TestCliProcess:
+    def test_build_prints_the_notice_once_and_exits_zero(self, tmp_path, monkeypatch):
+        """The user-facing stream, from a real process, with no provider mocked."""
+        import os
+
+        repo = _git_repo(tmp_path, monkeypatch)
+        home = tmp_path / "home"
+        home.mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_DATA_HOME": str(home / ".local" / "share"),
+            "XDG_CACHE_HOME": str(home / ".cache"),
+            "APPDATA": str(home / "AppData"),
+            "CRG_HOME": str(home / ".code-review-graph"),
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "CRG_SERIAL_PARSE": "1",
+        }
+        script = (
+            "import sys\n"
+            "from code_review_graph.cli import main\n"
+            "try:\n"
+            "    main()\n"
+            "finally:\n"
+            "    print('LOADED', 'sentence_transformers' in sys.modules, file=sys.stderr)\n"
+        )
+        proc = subprocess.run(
+            [
+                sys.executable, "-c", script, "build", "--repo", str(repo),
+                "--embedding-provider", "local", "--embedding-model", "all-MiniLM-L6-v2",
+            ],
+            capture_output=True, text=True, encoding="utf-8", env=env, timeout=120,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stderr.count(REFRESH_SKIPPED_WARNING) == 1, proc.stderr
+        assert "LOADED False" in proc.stderr
+        assert "Full build:" in proc.stdout
+        assert not _embeddings_table_exists(repo)
