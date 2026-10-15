@@ -6,6 +6,7 @@ import builtins
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -805,6 +806,126 @@ def test_unwritable_output_returns_2(tmp_path, caplog, target):
     assert "Cannot write output file" in caplog.text
     if target == "missing-dir":
         assert not out.exists()
+
+
+# The consumer itself: the validator step of the privileged workflow, read
+# straight out of pr-review-comment.yml together with the cap it enforces, so
+# a Windows-written artifact is judged by the real check rather than by a
+# restatement of it, and the renderer's budget cannot drift from that cap.
+COMMENT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "pr-review-comment.yml"
+
+
+def _trusted_validator() -> tuple[str, dict[str, str]]:
+    """The validator step's Python source and its declared environment."""
+    import yaml  # a runtime dependency, but only these tests need it
+
+    workflow = yaml.safe_load(COMMENT_WORKFLOW.read_text(encoding="utf-8"))
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            run = step.get("run") or ""
+            if "Report artifact is empty or too large" not in run:
+                continue
+            lines = run.split("\n")
+            start = lines.index("python - <<'PY'") + 1
+            end = next(i for i in range(start, len(lines)) if lines[i].strip() == "PY")
+            source = "\n".join(lines[start:end]) + "\n"
+            return source, {key: str(value) for key, value in step["env"].items()}
+    raise AssertionError("validator step not found in pr-review-comment.yml")
+
+
+def _run_trusted_validator(tmp_path: Path, download: Path) -> subprocess.CompletedProcess:
+    source, declared = _trusted_validator()
+    script = tmp_path / "validator.py"
+    script.write_bytes(source.encode("utf-8"))
+    env = dict(os.environ)
+    env.update(declared)
+    env.update(
+        {
+            "DOWNLOAD_DIR": str(download),
+            "COMMENT_BODY": str(tmp_path / "crg-comment-body.md"),
+            "VALIDATED_PR_NUMBER": str(tmp_path / "crg-pr-number.txt"),
+        }
+    )
+    return subprocess.run(
+        [sys.executable, str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def test_renderer_budget_is_the_cap_the_trusted_workflow_enforces():
+    _source, declared = _trusted_validator()
+    assert render._MAX_BODY == int(declared["MAX_REPORT_BYTES"])
+    assert render.MARKER == declared["TRUSTED_MARKER"]
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_windows_artifact_at_the_cap_is_accepted_by_the_trusted_validator(
+    tmp_path, windows_text_writes, offset
+):
+    """#1076 end to end: the file main() writes on Windows passes the real check.
+
+    Before the fix all three were rejected ("Report artifact is empty or too
+    large"); the 59,999-byte body became the 61,399-byte artifact in the issue.
+    """
+    _source, declared = _trusted_validator()
+    cap = int(declared["MAX_REPORT_BYTES"])
+    source = tmp_path / "crg-report.json"
+    source.write_bytes(json.dumps(report_rendering_to_exactly(cap + offset)).encode("utf-8"))
+    download = tmp_path / "crg-report-download"
+    download.mkdir()
+    artifact = download / "crg-comment.md"
+    code = render.main(
+        ["--input", str(source), "--output", str(artifact), "--max-functions", "100000"]
+    )
+    assert code == 0
+    # pr-review.yml writes this on its Linux runner; bytes keep it exact here.
+    (download / "pr-number.txt").write_bytes(b"42\n")
+
+    completed = _run_trusted_validator(tmp_path, download)
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    wrapped = (tmp_path / "crg-comment-body.md").read_bytes().decode("utf-8")
+    assert wrapped.startswith(declared["TRUSTED_MARKER"] + "\n\n## code-review-graph review\n")
+    assert wrapped.rstrip("\n").endswith(render.FOOTER)
+
+
+@pytest.mark.parametrize(
+    "report_data",
+    [
+        pytest.param(json.loads(FIXTURE.read_text(encoding="utf-8")), id="analysis"),
+        pytest.param(_NON_ASCII_REPORT, id="non-ascii-names"),
+    ],
+)
+def test_windows_crlf_detect_changes_output_renders_the_exact_artifact(
+    tmp_path, windows_text_writes, report_data
+):
+    """The input the Action really gets on a Windows runner.
+
+    ``detect-changes`` prints ``json.dumps(result, indent=2)`` and the Action
+    redirects it into crg-report.json; Windows stdout is text mode, so that
+    file arrives ASCII-escaped with CRLF on every line. The artifact must be
+    the same LF-only bytes a Linux runner produces from the LF file.
+    """
+    printed = json.dumps(report_data, indent=2, default=str) + "\n"
+    lf_input = tmp_path / "lf.json"
+    lf_input.write_bytes(printed.encode("ascii"))
+    crlf_input = tmp_path / "crlf.json"
+    crlf_input.write_bytes(printed.replace("\n", "\r\n").encode("ascii"))
+    lf_out = tmp_path / "lf.md"
+    crlf_out = tmp_path / "crlf.md"
+
+    assert render.main(["--input", str(lf_input), "--output", str(lf_out)]) == 0
+    assert render.main(["--input", str(crlf_input), "--output", str(crlf_out)]) == 0
+
+    expected = (render.render_markdown(report_data) + "\n").encode("utf-8")
+    assert crlf_out.read_bytes() == expected
+    assert lf_out.read_bytes() == expected
 
 
 def test_a_body_that_still_fits_is_not_truncated(tmp_path):
