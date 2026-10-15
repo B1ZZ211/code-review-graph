@@ -282,3 +282,104 @@ def test_cli_install_then_uninstall_reproduction_from_issue_1068(
     capsys.readouterr()
 
     assert _strict(settings) == original
+
+
+# --- Audit additions for PR #1078 ----------------------------------------------
+
+_GEMINI_USER_SETTINGS = {
+    "theme": "GitHub",
+    "mcpServers": {"other": {"command": "other-server"}},
+    "hooks": {"BeforeTool": [{
+        "matcher": "run_shell_command",
+        "hooks": [{"type": "command", "command": "echo MY-OWN-HOOK"}],
+    }]},
+}
+
+
+def _comment_free(text: str) -> str:
+    """Drop comments but keep every comma, as Gemini CLI's settings loader does."""
+    from code_review_graph import jsonc
+
+    return " ".join(text[token.start:token.end] for token in jsonc.tokenize(text))
+
+
+def test_cli_gemini_install_then_uninstall_keeps_shared_settings_strict(
+    fake_repo: Path, fake_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Gemini keeps the MCP entry and the hooks in one file; both edits must stay strict."""
+    from code_review_graph import cli
+
+    settings = fake_repo / ".gemini" / "settings.json"
+    _write_json(settings, _GEMINI_USER_SETTINGS)
+
+    argv = ["code-review-graph", "install", "--repo", str(fake_repo), "-y",
+            "--platform", "gemini-cli"]
+    with patch.object(sys, "argv", argv):
+        cli.main()
+    installed = _strict(settings)
+    assert "code-review-graph" in installed["mcpServers"]
+    assert {"SessionStart", "AfterTool"} <= set(installed["hooks"])
+
+    argv = ["code-review-graph", "uninstall", "--repo", str(fake_repo), "-y"]
+    with patch.object(sys, "argv", argv):
+        cli.main()
+    capsys.readouterr()
+
+    assert _strict(settings) == _GEMINI_USER_SETTINGS
+
+
+def test_gemini_settings_commented_after_install_stay_strict_without_comments(
+    fake_repo: Path, fake_home: Path
+) -> None:
+    """Gemini CLI strips comments and then parses strictly, so commas still matter."""
+    settings = fake_repo / ".gemini" / "settings.json"
+    _write_json(settings, _GEMINI_USER_SETTINGS)
+    skills.install_gemini_cli_hooks(fake_repo)
+
+    # The user annotates the installed file, including right after the comma
+    # that uninstall exposes when it drops the trailing crg events.
+    text = settings.read_text(encoding="utf-8")
+    text = text.replace("{\n", "{\n  // my Gemini settings\n", 1)
+    text = text.replace('  "hooks": {', '  /* hooks below */\n  "hooks": {', 1)
+    assert text.count('    ],\n    "SessionStart"') == 1
+    text = text.replace('    ],\n    "SessionStart"', '    ], // mine\n    "SessionStart"')
+    settings.write_text(text, encoding="utf-8")
+
+    report = uninstall.run(repo=fake_repo, keep_data=True)
+
+    assert not report.errors
+    raw = settings.read_text(encoding="utf-8")
+    for comment in ("// my Gemini settings", "/* hooks below */", "// mine"):
+        assert comment in raw
+    assert json.loads(_comment_free(raw)) == _GEMINI_USER_SETTINGS
+
+
+def test_owned_group_after_a_user_group_holding_owned_hooks_leaves_strict_json(
+    fake_repo: Path, fake_home: Path
+) -> None:
+    """Nested removals inside one group plus removal of the next group, in one splice."""
+    settings = fake_repo / ".claude" / "settings.json"
+    owned = sorted({
+        hook["command"]
+        for entries in skills.generate_hooks_config(fake_repo)["hooks"].values()
+        for entry in entries
+        for hook in entry["hooks"]
+    })
+    user_hook = {"type": "command", "command": "echo mine"}
+    original = {
+        "hooks": {"PostToolUse": [{"matcher": "Edit|Write", "hooks": [user_hook]}]},
+        "permissions": _USER_PERMISSIONS,
+    }
+    seeded = copy.deepcopy(original)
+    seeded["hooks"]["PostToolUse"][0]["hooks"].extend(
+        {"type": "command", "command": command} for command in owned
+    )
+    seeded["hooks"]["PostToolUse"].append(
+        {"matcher": "", "hooks": [{"type": "command", "command": owned[0]}]}
+    )
+    _write_json(settings, seeded)
+
+    report = uninstall.run(repo=fake_repo, keep_data=True)
+
+    assert not report.errors
+    assert _strict(settings) == original

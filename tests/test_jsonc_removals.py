@@ -227,3 +227,148 @@ def test_large_document_tail_and_interleaved_removals():
 def test_unresolvable_paths_still_raise(raw, paths, error):
     with pytest.raises(error):
         remove_paths(raw, paths)
+
+
+# --- Audit additions for PR #1078 ----------------------------------------------
+
+_FUZZ_SCALARS = (1, 2.5, True, None, "s,}", "x//y /* z */", 'q"],', "ü😀\\")
+
+
+def _random_value(rng, depth):
+    roll = rng.random()
+    if depth <= 0 or roll < 0.3:
+        return rng.choice(_FUZZ_SCALARS)
+    size = rng.randint(0, 4)
+    if roll < 0.65:
+        return {f"k{index}": _random_value(rng, depth - 1) for index in range(size)}
+    return [_random_value(rng, depth - 1) for _ in range(size)]
+
+
+def _render_jsonc(value, rng, path, trailing_at, *, depth, compact, trailing, comments):
+    """Render ``value`` as JSONC and record the containers given a trailing comma."""
+    if not isinstance(value, (dict, list)) or not value:
+        return json.dumps(value, ensure_ascii=False)
+    is_object = isinstance(value, dict)
+    items = list(value.items()) if is_object else list(enumerate(value))
+    newline = "" if compact else "\n"
+    pad = "" if compact else "  " * (depth + 1)
+    parts = []
+    for position, (key, child) in enumerate(items):
+        comma = ","
+        if position == len(items) - 1:
+            comma = "," if trailing and rng.random() < 0.5 else ""
+            if comma:
+                trailing_at.add(path)
+        note = ""
+        if comments and rng.random() < 0.35:
+            note = " /* note ] , */" if compact or rng.random() < 0.5 else " // note ,}"
+        body = _render_jsonc(
+            child, rng, path + (key,), trailing_at,
+            depth=depth + 1, compact=compact, trailing=trailing, comments=comments,
+        )
+        head = f"{json.dumps(key, ensure_ascii=False)}: " if is_object else ""
+        parts.append(f"{pad}{head}{body}{comma}{note}")
+    opening, closing = ("{", "}") if is_object else ("[", "]")
+    close_pad = "" if compact else "  " * depth
+    return opening + newline + newline.join(parts) + newline + close_pad + closing
+
+
+def _all_paths(value, prefix=()):
+    children = (
+        value.items() if isinstance(value, dict)
+        else enumerate(value) if isinstance(value, list) else ()
+    )
+    for key, child in children:
+        yield prefix + (key,)
+        yield from _all_paths(child, prefix + (key,))
+
+
+def _without(value, removed, prefix=()):
+    if isinstance(value, dict):
+        return {
+            key: _without(child, removed, prefix + (key,))
+            for key, child in value.items() if prefix + (key,) not in removed
+        }
+    if isinstance(value, list):
+        return [
+            _without(child, removed, prefix + (index,))
+            for index, child in enumerate(value) if prefix + (index,) not in removed
+        ]
+    return value
+
+
+def _walk(value, path):
+    for key in path:
+        value = value[key]
+    return value
+
+
+def _is_deletion_of(original: str, rewritten: str) -> bool:
+    """Whether ``rewritten`` is ``original`` with characters only deleted."""
+    remaining = iter(original)
+    return all(char in remaining for char in rewritten)
+
+
+def _comment_free(text: str) -> str:
+    """Drop comments but keep every comma, as strip-json-comments would."""
+    return " ".join(text[token.start:token.end] for token in jsonc.tokenize(text))
+
+
+def test_random_nested_jsonc_removals_match_the_parsed_edit():
+    """Seeded sweep: nested containers, comments, JSONC trailing commas, overlaps.
+
+    For every case the splice must equal the same edit made on the parsed
+    value, may only delete characters, must keep exactly the original trailing
+    commas whose container and last element survive, and, for a file that had
+    none, must leave strict JSON once its comments are stripped.
+    """
+    import random
+
+    rng = random.Random(1078)
+    for case in range(3000):
+        value = {"root": _random_value(rng, 3), "tail": _random_value(rng, 2)}
+        trailing = rng.random() < 0.4
+        trailing_at: set = set()
+        raw = _render_jsonc(
+            value, rng, (), trailing_at,
+            depth=0, compact=rng.random() < 0.25, trailing=trailing,
+            comments=rng.random() < 0.5,
+        )
+        paths = list(_all_paths(value))
+        chosen = rng.sample(paths, rng.randint(0, min(len(paths), 6)))
+        if chosen and rng.random() < 0.1:
+            chosen.append(rng.choice(chosen))
+        removed = set(chosen)
+        context = (case, raw, chosen)
+
+        rewritten = remove_paths(raw, chosen)
+
+        assert json.loads(_strip_jsonc(rewritten)) == _without(value, removed), context
+        assert _is_deletion_of(raw, rewritten), context
+        kept_trailing = 0
+        for path in trailing_at:
+            container = _walk(value, path)
+            last = list(container)[-1] if isinstance(container, dict) else len(container) - 1
+            gone = any(path[:size] in removed for size in range(1, len(path) + 1))
+            if not gone and path + (last,) not in removed:
+                kept_trailing += 1
+        assert len(_exposed_trailing_commas(rewritten)) == kept_trailing, context
+        if not trailing:
+            assert json.loads(_comment_free(rewritten)) == _without(value, removed), context
+
+
+@pytest.mark.parametrize("raw,paths,expected", [
+    ("[1, 2, 3]", [(1,), (2,)], [1]),
+    ("[1, 2, 3]", [(0,), (2,)], [2]),
+    ('[{"a": 1, "b": 2, "c": 3}, 4, 5]', [(0, "b"), (0, "c"), (1,), (2,)], [{"a": 1}]),
+])
+def test_top_level_array_removals_leave_strict_json(raw, paths, expected):
+    assert json.loads(remove_paths(raw, paths)) == expected
+
+
+def test_comma_after_a_value_comment_is_dropped_and_the_comment_kept():
+    raw = '{\n  "keep": 1 /* why */, // after\n  "a": 2,\n  "b": 3\n}\n'
+    rewritten = remove_paths(raw, [("a",), ("b",)])
+    assert "/* why */" in rewritten and "// after" in rewritten
+    assert _exposed_trailing_commas(rewritten) == []
+    assert json.loads(_comment_free(rewritten)) == {"keep": 1}
