@@ -12,6 +12,7 @@ before the parser recorded ``typescript_kind``.
 """
 
 import json
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -20,8 +21,9 @@ import pytest
 
 from code_review_graph.changes import analyze_changes
 from code_review_graph.graph import GraphStore
-from code_review_graph.incremental import full_build, incremental_update
+from code_review_graph.incremental import full_build, get_db_path, incremental_update
 from code_review_graph.parser import CodeParser, NodeInfo
+from code_review_graph.tools.review import detect_changes_func
 
 
 def test_parser_tags_interfaces_and_type_aliases_only():
@@ -144,12 +146,25 @@ def test_wrapped_and_ambient_declarations_are_tagged(source, name, kind):
     assert classes[name].extra["typescript_kind"] == kind
 
 
-def test_interface_method_signatures_do_not_become_function_gaps():
-    """Method signatures inside an interface are not Function nodes at all."""
+def test_interface_method_signatures_do_not_become_function_gaps(tmp_path):
+    """Method signatures inside an interface are not Function nodes, and a
+    whole-file change to an interface with methods reports no gap at all."""
     nodes, _ = CodeParser().parse_bytes(
-        Path("svc.ts"), b"export interface Svc { run(): void; go: () => void }\n",
+        Path("/r/svc.ts"),
+        b"export interface Svc {\n  run(): void;\n  go: () => void;\n}\n",
     )
     assert [n.name for n in nodes if n.kind == "Function"] == []
+
+    store = GraphStore(tmp_path / "graph.db")
+    try:
+        for node in nodes:
+            store.upsert_node(node, file_hash="abc")
+        store.commit()
+        result = analyze_changes(store, changed_files=["/r/svc.ts"])
+    finally:
+        store.close()
+    assert "Svc" in {f["name"] for f in result["changed_functions"]}
+    assert result["test_gaps"] == []
 
 
 def test_unicode_declaration_names_are_tagged():
@@ -441,3 +456,215 @@ class TestCollisionsAndScale:
         )
         assert {g["name"] for g in result["test_gaps"]} == {"Big", "run"}
         assert len(result["changed_functions"]) == 402
+
+
+# ---------------------------------------------------------------------------
+# A real Git diff through the MCP tool, a declaration changing kind across
+# updates, declarations nested in other scopes, and types-only files
+# ---------------------------------------------------------------------------
+
+_MULTILINE_WIDGET = (
+    "export interface WidgetProps {\n"
+    "  title: string;\n"
+    "}\n"
+    "export type Size = {\n"
+    "  w: number;\n"
+    "};\n"
+    "export class Panel {\n"
+    "  render() {\n"
+    "    return 1;\n"
+    "  }\n"
+    "}\n"
+)
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        [
+            "git", "-c", "user.email=test@example.com", "-c", "user.name=Test",
+            "-c", "commit.gpgsign=false", *args,
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        timeout=30,
+    )
+
+
+class TestRealDiffThroughTheTool:
+    """Build -> edit -> update -> ``detect_changes_func`` against a real Git
+    diff. The diff's line ranges fall inside multi-line declaration bodies,
+    so this pins the range-to-node mapping the reporter's MCP calls use, in
+    both detail levels."""
+
+    @pytest.fixture
+    def repo(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+        root = tmp_path / "ts repo \u00e9"
+        (root / "src").mkdir(parents=True)
+        _git(root, "init", "-q")
+        (root / "src" / "widget.tsx").write_text(_MULTILINE_WIDGET, encoding="utf-8")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "init")
+        store = GraphStore(get_db_path(root))
+        try:
+            assert full_build(root, store)["errors"] == []
+        finally:
+            store.close()
+        return root
+
+    @staticmethod
+    def _edit_and_update(root: Path, old: str, new: str) -> None:
+        path = root / "src" / "widget.tsx"
+        text = path.read_text(encoding="utf-8")
+        assert old in text
+        path.write_text(text.replace(old, new), encoding="utf-8")
+        store = GraphStore(get_db_path(root))
+        try:
+            incremental_update(root, store, changed_files=["src/widget.tsx"])
+        finally:
+            store.close()
+
+    def test_edits_inside_declaration_bodies_report_no_gap(self, repo):
+        self._edit_and_update(repo, "title: string;", "title: number;")
+        self._edit_and_update(repo, "w: number;", "w: string;")
+
+        result = detect_changes_func(base="HEAD", repo_root=str(repo))
+        assert result["status"] == "ok"
+        assert {f["name"] for f in result["changed_functions"]} == {"WidgetProps", "Size"}
+        assert result["test_gaps"] == []
+        assert result["test_gaps_total"] == 0
+
+        minimal = detect_changes_func(
+            base="HEAD", repo_root=str(repo), detail_level="minimal",
+        )
+        assert minimal["status"] == "ok"
+        assert minimal["test_gap_count"] == 0
+
+    def test_edit_inside_the_class_body_still_reports_its_gaps(self, repo):
+        self._edit_and_update(repo, "return 1;", "return 2;")
+
+        result = detect_changes_func(base="HEAD", repo_root=str(repo))
+        assert result["status"] == "ok"
+        assert {g["name"] for g in result["test_gaps"]} == {"Panel", "render"}
+
+        minimal = detect_changes_func(
+            base="HEAD", repo_root=str(repo), detail_level="minimal",
+        )
+        assert minimal["test_gap_count"] == 2
+
+
+def test_tag_follows_a_declaration_that_changes_kind_across_updates(tmp_path):
+    """An interface refactored into a class must become a gap on the next
+    update, and turning it back into a type must drop it again: the tag is
+    rewritten with the node, never left behind on it."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / ".git").mkdir()
+    src = root / "shape.ts"
+    src.write_text("export interface Shape {\n  area(): number;\n}\n", encoding="utf-8")
+    store = GraphStore(root / "graph.db")
+    try:
+        with patch(
+            "code_review_graph.incremental.get_all_tracked_files",
+            return_value=["shape.ts"],
+        ):
+            assert full_build(root, store)["errors"] == []
+
+        def gaps() -> set[str]:
+            (path,) = [f for f in store.get_all_files() if f.endswith("shape.ts")]
+            result = analyze_changes(store, changed_files=[path])
+            return {g["name"] for g in result["test_gaps"]}
+
+        assert gaps() == set()
+
+        src.write_text(
+            "export class Shape {\n  area() { return 1; }\n}\n", encoding="utf-8",
+        )
+        incremental_update(root, store, changed_files=["shape.ts"])
+        assert gaps() == {"Shape", "area"}
+
+        src.write_text("export type Shape = {\n  area(): number;\n};\n", encoding="utf-8")
+        incremental_update(root, store, changed_files=["shape.ts"])
+        assert gaps() == set()
+    finally:
+        store.close()
+
+
+class TestNestedAndTypesOnlyFiles:
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.store = GraphStore(self.tmp.name)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _store_parsed(self, path: str, source: str) -> None:
+        nodes, _ = CodeParser().parse_bytes(Path(path), source.encode("utf-8"))
+        for node in nodes:
+            self.store.upsert_node(node, file_hash="abc")
+        self.store.commit()
+
+    def test_declarations_local_to_a_function_drop_out_but_the_function_stays(self):
+        self._store_parsed(
+            "/r/outer.ts",
+            "export function outer() {\n"
+            "  interface Local { a: number }\n"
+            "  type Alias = Local | null;\n"
+            "  return 1;\n"
+            "}\n",
+        )
+        result = analyze_changes(
+            self.store,
+            changed_files=["/r/outer.ts"],
+            changed_ranges={"/r/outer.ts": [(2, 3)]},
+        )
+        assert {"Local", "Alias"} <= {f["name"] for f in result["changed_functions"]}
+        assert {g["name"] for g in result["test_gaps"]} == {"outer"}
+
+    @pytest.mark.parametrize(
+        ("path", "source", "expected"),
+        [
+            (
+                "/r/global.d.ts",
+                "declare global {\n"
+                "  interface Window { crg: string }\n"
+                "}\n"
+                "export type Id = string;\n"
+                "export interface Box<T> { v: T }\n",
+                set(),
+            ),
+            (
+                "/r/Setup.vue",
+                "<script setup lang=\"ts\">\n"
+                "export interface P { a: string }\n"
+                "type S = number;\n"
+                "function f() { return 1; }\n"
+                "</script>\n"
+                "<template><div/></template>\n",
+                {"f"},
+            ),
+            (
+                "/r/Module.svelte",
+                "<script context=\"module\" lang=\"ts\">\n"
+                "  export interface P { a: string }\n"
+                "  export function g() { return 1; }\n"
+                "</script>\n"
+                "<div/>\n",
+                {"g"},
+            ),
+        ],
+        ids=["d.ts", "vue-script-setup", "svelte-module-script"],
+    )
+    def test_whole_file_change_reports_only_runtime_code(self, path, source, expected):
+        """Whole-file fallback over a types-only ``.d.ts`` and over Vue and
+        Svelte script variants: declarations are changed nodes but never
+        gaps, and the runtime function next to them still is."""
+        self._store_parsed(path, source)
+        result = analyze_changes(self.store, changed_files=[path])
+        assert result["changed_functions"], "the file produced no changed nodes"
+        assert {g["name"] for g in result["test_gaps"]} == expected
