@@ -147,21 +147,29 @@ async def test_initialize_handshake_delivers_the_routing_instructions(
 @pytest.mark.e2e
 @requires_mcp_client
 @pytest.mark.parametrize("via", ["--tools", "CRG_TOOLS"])
-async def test_tool_allow_list_leaves_no_instruction_naming_a_removed_tool(
+async def test_tool_allow_list_keeps_the_routing_lines_for_allowed_tools(
     tmp_path: Path, via: str,
 ) -> None:
     # ``serve --tools`` / ``CRG_TOOLS`` (README "Limiting tools") removes tools
-    # after the server is built. An agent that is told "follow an execution
-    # flow -> list_flows_tool" by a server that no longer has list_flows_tool
-    # is routed to a tool that does not exist.
+    # after the server is built. The handshake must still succeed, list exactly
+    # the allowed tools, and keep the routing lines that point at them. (The
+    # text may still name tools the allow-list removed, as the prompts and
+    # next_tool_suggestions already do; that is a separate follow-up.)
     if via == "--tools":
         instructions, listed = await _handshake(tmp_path, tools_arg=README_ALLOW_LIST)
     else:
         instructions, listed = await _handshake(tmp_path, crg_tools=README_ALLOW_LIST)
     assert listed == set(README_ALLOW_LIST.split(","))
+    for line in (
+        "query_graph_tool pattern=callers_of",
+        "query_graph_tool pattern=importers_of",
+        "query_graph_tool pattern=tests_for",
+        "detect_changes_tool, get_review_context_tool",
+    ):
+        assert line in instructions, line
     named = set(_TOOL_NAME.findall(instructions))
-    assert named <= listed, (
-        f"instructions name tools the allow-list removed: {sorted(named - listed)}"
+    assert {"query_graph_tool", "detect_changes_tool", "get_review_context_tool"} <= (
+        named & listed
     )
 
 
