@@ -186,13 +186,9 @@ def test_member_call_scan_sees_production_caller_among_many_story_rows(tmp_path)
         assert 'Widget' not in _dead_names(store, tmp_path)
 
 
-@pytest.mark.parametrize('caller_file, alive', [
-    ('animal.stories.ts', False),
-    ('app.ts', True),
-])
-def test_story_call_to_base_method_does_not_keep_override_alive(tmp_path, caller_file, alive):
-    # Polymorphic dispatch: a call to Animal.speak keeps Dog.speak alive. A
-    # story's call is not application use, so it must not do that either.
+def test_production_call_to_base_method_still_keeps_override_alive(tmp_path):
+    # Polymorphic dispatch: an application call to Animal.speak keeps
+    # Dog.speak alive. The story filter must not drop that path.
     with GraphStore(tmp_path / 'graph.db') as store:
         store.upsert_node(NodeInfo('Class', 'Animal', 'animal.ts', 1, 5, 'typescript'))
         store.upsert_node(NodeInfo('Function', 'speak', 'animal.ts', 2, 4, 'typescript',
@@ -201,26 +197,25 @@ def test_story_call_to_base_method_does_not_keep_override_alive(tmp_path, caller
         store.upsert_node(NodeInfo('Function', 'speak', 'dog.ts', 2, 4, 'typescript',
                                    parent_name='Dog'))
         store.upsert_edge(EdgeInfo('INHERITS', 'dog.ts::Dog', 'Animal', 'dog.ts', 1))
-        store.upsert_edge(EdgeInfo('CALLS', f'{caller_file}::Use', 'animal.ts::Animal.speak',
-                                  caller_file, 3))
+        store.upsert_edge(EdgeInfo('CALLS', 'Animal.stories.ts::Use', 'animal.ts::Animal.speak',
+                                  'Animal.stories.ts', 3))
+        store.upsert_edge(EdgeInfo('CALLS', 'app.ts::main', 'animal.ts::Animal.speak',
+                                  'app.ts', 3))
         store.commit()
-        assert ('dog.ts::Dog.speak' not in _dead_qualified(store, tmp_path)) is alive
+        dead = _dead_qualified(store, tmp_path)
+        assert 'animal.ts::Animal.speak' not in dead
+        assert 'dog.ts::Dog.speak' not in dead
 
 
-@pytest.mark.parametrize('helper_file, alive', [
-    ('User.stories.ts', False),
-    ('api.ts', True),
-])
-def test_story_type_annotation_does_not_keep_type_alive(tmp_path, helper_file, alive):
-    # Story fixture factories are typed (``(): UserShape => ...``). Like a
-    # story's call, its annotation is not application use.
+def test_production_type_annotation_still_keeps_type_alive(tmp_path):
+    # Story files are now test code; an application function's annotation
+    # must still count as a use of the type.
     with GraphStore(tmp_path / 'graph.db') as store:
         store.upsert_node(NodeInfo('Class', 'UserShape', 'user.ts', 1, 3, 'typescript'))
-        store.upsert_node(NodeInfo('Function', 'makeUser', helper_file, 1, 3, 'typescript',
-                                   params='()', return_type=': UserShape',
-                                   is_test=is_test_file(helper_file)))
+        store.upsert_node(NodeInfo('Function', 'loadUser', 'api.ts', 1, 3, 'typescript',
+                                   params='()', return_type=': UserShape'))
         store.commit()
-        assert ('UserShape' not in _dead_names(store, tmp_path)) is alive
+        assert 'UserShape' not in _dead_names(store, tmp_path)
 
 
 def _write(path, text):
