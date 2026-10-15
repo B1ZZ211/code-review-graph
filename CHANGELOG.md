@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A rename rewrites the import statements that name the symbol (#1107).
+  The preview looked for import edges that target the symbol, but Python
+  import edges target the imported module's file, so `from pkg.util import
+  helper` was never edited and the applied code raised `ImportError`. The
+  preview now reads the defining module and every module that imports it,
+  and follows Python's scope rules: `from module import name` in every
+  spelling (several names on a line, parenthesized over several lines with
+  comments, `as` aliases, relative imports), packages that re-export the
+  name and their `__all__`, `import module` then `module.name`, and
+  imports inside functions. JavaScript and TypeScript get the same for
+  `import { name }`, `import { name as x }`, `import * as ns`, local
+  export lists and `export { name } from` barrels. An alias keeps its own
+  name; a parameter, local, comprehension variable or class attribute that
+  reuses the name is left alone, and so are comments, strings and longer
+  names that contain it.
+- Rename edits are exact. Each one carries the `column` where the old name
+  starts and the `site` it is (`definition`, `call`, `reference`,
+  `import`, `export`, `attribute`, `__all__`), and applying replaces the
+  name only there. Before, applying replaced the first substring match on
+  the line (`helper_count` became `double_count`) and, when the line had
+  none, the first match anywhere in the file. A method call chained over
+  several lines, or made inside an f-string, is renamed where its name is
+  rather than in a comment or the string's text. An edit that no longer
+  matches is skipped and counted in `edits_skipped`. CRLF line endings, a
+  byte-order mark and non-ASCII text survive, and a file that is not UTF-8
+  is no longer rewritten with replacement characters.
+- `refactor_tool(mode="rename")` resolves `old_name` exactly. It accepts a
+  name, `Class.method` or a qualified name such as `pkg/util.py::helper`.
+  When a bare name belongs to several symbols the first by file and line
+  is renamed, and the preview's new `qualified_name` says which; pass a
+  qualified name to pick another. A name that matches no symbol is
+  `not_found` instead of falling back to a symbol whose name merely
+  contains it.
+
 ## [2.3.9] - 2026-09-18
 
 ### Added
