@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The MCP server instructions now route by question type instead of introducing
+  the server as a code-review tool. With deferred tool loading an agent sees
+  only the tool names and these instructions, so "for code reviews" kept it on
+  Grep for callers, importers and covering tests everywhere else. The new text
+  maps each relationship question to its tool and leaves plain-text search to
+  Grep. Measured with Claude Code on one TypeScript monorepo: across 8 ordinary
+  tasks that never mention the graph (implement, review, brainstorm, plan), the
+  graph was used in 1 run before and 6 after; plain-text questions stayed on
+  Grep (0 of 4 moved). `tests/test_server_instructions.py` keeps every tool and
+  query pattern the text names registered.
+
+### Fixed
+
+- An explicit embedding refresh (`--embedding-provider` with
+  `--embedding-model`, or the `embedding_provider` and `embedding_model`
+  arguments of `build_or_update_graph_tool` and `run_postprocess_tool`) on a
+  graph with no embeddings yet now reports that it embedded nothing. `build`,
+  `update` and `postprocess` return `embeddings_refresh_skipped: true` and a
+  warning to run `code-review-graph embed` once, and so does an `update`
+  that finds no changes. `watch` logs the same warning after each update and
+  keeps running; a refresh that fails against an existing index still stops
+  it, as before. The refresh used to return `ok` with no embedding field,
+  the same result as a build that never asked for one. It still loads no
+  model and makes no network call in that case (#1070).
+
 ## [2.3.9] - 2026-09-18
 
 ### Added
