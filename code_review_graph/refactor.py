@@ -25,7 +25,7 @@ from typing import Any, Optional, Union
 
 from .flows import _has_framework_decorator, _matches_entry_name
 from .graph import GraphNode, GraphStore, _sanitize_name
-from .parser import CodeParser, normalize_file_path
+from .parser import _STORYBOOK_FILE_RE, CodeParser, normalize_file_path
 from .parser import is_test_file as _is_test_file
 from .parser import repo_relative_path as _repo_relative
 
@@ -2164,12 +2164,18 @@ def find_dead_code(
             if base_name is not None:
                 continue
 
-        incoming = store.get_edges_by_target(node.qualified_name)
+        incoming = [
+            e for e in store.get_edges_by_target(node.qualified_name)
+            if not _STORYBOOK_FILE_RE.search(e.file_path)
+        ]
         # Also check class-qualified edges (e.g. "ClassName::method") which
         # lack the file-path prefix used in node.qualified_name.
         if not any(e.kind == "CALLS" for e in incoming) and node.parent_name:
             class_qn = f"{node.parent_name}::{node.name}"
-            incoming = incoming + store.get_edges_by_target(class_qn)
+            incoming += [
+                e for e in store.get_edges_by_target(class_qn)
+                if not _STORYBOOK_FILE_RE.search(e.file_path)
+            ]
         # Also check bare-name and partially-qualified edges.
         # CALLS targets may be bare ("funcName"), class-qualified
         # ("Class::method"), or workspace-qualified ("pkg/dir::funcName").
@@ -2226,6 +2232,10 @@ def find_dead_code(
                 language=node.language or None,
             )
             incoming = incoming + bare_inh
+        # Stories demonstrate a component but do not prove application use.
+        # Check paths as well as flags so pre-existing graphs behave correctly.
+        incoming = [e for e in incoming if not _STORYBOOK_FILE_RE.search(e.file_path)]
+        outgoing_tb = [e for e in outgoing_tb if not _STORYBOOK_FILE_RE.search(e.file_path)]
         has_callers = any(e.kind == "CALLS" for e in incoming)
         has_test_refs = bool(outgoing_tb)
         has_importers = any(e.kind == "IMPORTS_FROM" for e in incoming)
@@ -2242,11 +2252,11 @@ def find_dead_code(
             # Also check bare class-name pattern (unresolved CALLS targets)
             bare_prefix = node.name + "."
             member_calls = conn.execute(
-                "SELECT COUNT(*) FROM edges WHERE kind = 'CALLS'"
+                "SELECT file_path FROM edges WHERE kind = 'CALLS'"
                 " AND (target_qualified LIKE ? OR target_qualified LIKE ?)",
                 (f"%{member_prefix}%", f"%{bare_prefix}%"),
-            ).fetchone()[0]
-            if member_calls > 0:
+            )
+            if any(not _STORYBOOK_FILE_RE.search(row[0]) for row in member_calls):
                 has_callers = True
 
         if not (
