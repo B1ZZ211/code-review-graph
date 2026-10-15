@@ -375,6 +375,9 @@ class TestWhatARenameMustNotTouch:
         preview = _rename_and_apply(root, "pkg/util.py::helper", "double")
         assert preview["qualified_name"].endswith("pkg/util.py::helper")
         assert {Path(e["file"]).name for e in preview["edits"]} == {"util.py", "main.py"}
+        # The picked symbol really is renamed, not just left runnable.
+        assert _read(root, "pkg/util.py").startswith("def double(x):\n")
+        assert _read(root, "pkg/main.py") == "from pkg.util import double\n\nMAIN = double(1)\n"
         assert _read(root, "pkg/other.py") == other
         assert _read(root, "pkg/other_user.py") == other_user
         assert _run(
@@ -1049,4 +1052,860 @@ class TestOtherLanguagesStillRename:
         ]
         assert _read(root, "main.go").splitlines()[5] == (
             "\tfmt.Println(\"Helper\", HelperCount, Twice(2)) // Helper"
+        )
+
+
+class TestRepositoryLayouts:
+    """Import edges resolve in the layouts real projects use, so the
+    import statements are found and rewritten in each of them."""
+
+    def test_src_layout(self, tmp_path):
+        root = _repo(tmp_path, {
+            "pyproject.toml": "[project]\nname = 'pkg'\n",
+            "src/pkg/__init__.py": "",
+            "src/pkg/util.py": _UTIL,
+            "src/pkg/main.py": "from pkg.util import helper\n\nVALUE = helper(1)\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/pkg/main.py") == (
+            "from pkg.util import double\n\nVALUE = double(1)\n"
+        )
+        assert _run(root / "src", "import pkg.main; print(pkg.main.VALUE)") == "2"
+
+    def test_tests_directory_imports_the_package(self, tmp_path):
+        test_module = (
+            "from pkg.util import helper\n"
+            "\n"
+            "\n"
+            "def test_helper():\n"
+            "    assert helper(2) == 4\n"
+        )
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/util.py": _UTIL,
+            "tests/test_util.py": test_module,
+        })
+        _rename_and_apply(root, "helper", "double")
+        # The test function keeps its own name; only the symbol is renamed.
+        assert _read(root, "tests/test_util.py") == (
+            test_module.replace("import helper", "import double")
+            .replace("assert helper(2)", "assert double(2)")
+        )
+
+    def test_namespace_package_without_init(self, tmp_path):
+        root = _repo(tmp_path, {
+            "pkg/util.py": _UTIL,
+            "pkg/main.py": "from pkg.util import helper\n\nVALUE = helper(3)\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "pkg/main.py") == "from pkg.util import double\n\nVALUE = double(3)\n"
+        assert _run(root, "import pkg.main; print(pkg.main.VALUE)") == "6"
+
+    def test_flat_scripts_next_to_each_other(self, tmp_path):
+        root = _repo(tmp_path, {
+            "util.py": _UTIL,
+            "main.py": (
+                "from util import helper\nimport util\n\nVALUE = helper(3) + util.helper(1)\n"
+            ),
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "main.py") == (
+            "from util import double\nimport util\n\nVALUE = double(3) + util.double(1)\n"
+        )
+        assert _run(root, "import main; print(main.VALUE)") == "8"
+
+    def test_symbol_defined_in_a_package_init(self, tmp_path):
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/util/__init__.py": _UTIL,
+            "pkg/main.py": (
+                "from pkg.util import helper\n"
+                "import pkg.util\n"
+                "\n"
+                "VALUE = helper(3) + pkg.util.helper(1)\n"
+            ),
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "pkg/main.py") == (
+            "from pkg.util import double\n"
+            "import pkg.util\n"
+            "\n"
+            "VALUE = double(3) + pkg.util.double(1)\n"
+        )
+        assert _run(root, "import pkg.main; print(pkg.main.VALUE)") == "8"
+
+
+class TestMorePythonImportShapes:
+    def test_star_reexport_renames_the_home_modules_all(self, tmp_path):
+        """``pkg/__init__.py`` never spells the name, yet re-exports it
+        through ``import *``; the home module's ``__all__`` decides what the
+        star passes on, so it must follow the rename."""
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "from .util import *\n",
+            "pkg/util.py": "__all__ = ['helper', 'a']\n\n\n" + _UTIL,
+            "app/__init__.py": "",
+            "app/use.py": "from pkg import helper\n\nVALUE = helper(3)\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "pkg/__init__.py") == "from .util import *\n"
+        assert _read(root, "pkg/util.py").startswith("__all__ = ['double', 'a']\n")
+        assert _read(root, "app/use.py") == "from pkg import double\n\nVALUE = double(3)\n"
+        assert _run(root, "import app.use; print(app.use.VALUE)") == "6"
+
+    def test_reexport_through_two_packages(self, tmp_path):
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "from .sub import helper\n\n__all__ = ['helper']\n",
+            "pkg/sub/__init__.py": "from .util import helper\n",
+            "pkg/sub/util.py": _UTIL,
+            "app/__init__.py": "",
+            "app/use.py": (
+                "from pkg import helper\n"
+                "from pkg.sub import helper as h\n"
+                "\n"
+                "VALUE = helper(3) + h(1)\n"
+            ),
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "pkg/__init__.py") == "from .sub import double\n\n__all__ = ['double']\n"
+        assert _read(root, "pkg/sub/__init__.py") == "from .util import double\n"
+        assert _read(root, "app/use.py") == (
+            "from pkg import double\n"
+            "from pkg.sub import double as h\n"
+            "\n"
+            "VALUE = double(3) + h(1)\n"
+        )
+        assert _run(root, "import app.use; print(app.use.VALUE)") == "8"
+
+    def test_relative_import_of_the_module_then_attribute(self, tmp_path):
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/util.py": _UTIL,
+            "pkg/main.py": (
+                "from . import util\n"
+                "from pkg import util as u\n"
+                "\n"
+                "VALUE = util.helper(1) + u.helper(2)\n"
+            ),
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "pkg/main.py") == (
+            "from . import util\n"
+            "from pkg import util as u\n"
+            "\n"
+            "VALUE = util.double(1) + u.double(2)\n"
+        )
+        assert _run(root, "import pkg.main; print(pkg.main.VALUE)") == "6"
+
+    def test_type_checking_block_and_try_except_fallback(self, tmp_path):
+        main = (
+            "from typing import TYPE_CHECKING\n"
+            "\n"
+            "if TYPE_CHECKING:\n"
+            "    from pkg.util import Widget\n"
+            "\n"
+            "try:\n"
+            "    from pkg.util import helper\n"
+            "except ImportError:\n"
+            "    helper = None\n"
+            "\n"
+            "\n"
+            "def make(w: 'Widget') -> int:\n"
+            "    return helper(1)\n"
+        )
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/util.py": _UTIL,
+            "pkg/main.py": main,
+        })
+        _rename_and_apply(root, "helper", "double")
+        # The fallback binds the same module name, so it is renamed with it.
+        assert _read(root, "pkg/main.py") == (
+            main.replace("import helper\n", "import double\n")
+            .replace("    helper = None\n", "    double = None\n")
+            .replace("return helper(1)", "return double(1)")
+        )
+        assert _run(root, "import pkg.main; print(pkg.main.make(None))") == "2"
+
+
+class TestUsesBeyondPlainCalls:
+    def test_function_used_as_a_decorator_and_a_keyword_value(self, tmp_path):
+        main = (
+            "from pkg.deco import retry\n"
+            "\n"
+            "\n"
+            "@retry()\n"
+            "def one():\n"
+            "    return 1\n"
+            "\n"
+            "\n"
+            "@retry(times=3)\n"
+            "def two():\n"
+            "    return 2\n"
+            "\n"
+            "\n"
+            "def call(retry=None):\n"
+            "    return retry\n"
+            "\n"
+            "\n"
+            "VALUE = (one(), two(), call(retry=retry) is retry)\n"
+        )
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/deco.py": (
+                "def retry(times=1):\n"
+                "    def wrap(fn):\n"
+                "        return fn\n"
+                "    return wrap\n"
+            ),
+            "pkg/main.py": main,
+        })
+        _rename_and_apply(root, "retry", "with_retry")
+        # The parameter and the keyword argument's name are not the symbol.
+        assert _read(root, "pkg/main.py") == (
+            main.replace("import retry\n", "import with_retry\n")
+            .replace("@retry(", "@with_retry(")
+            .replace("call(retry=retry) is retry", "call(retry=with_retry) is with_retry")
+        )
+        assert _run(root, "import pkg.main; print(pkg.main.VALUE)") == "(1, 2, True)"
+
+    def test_decorated_definition(self, tmp_path):
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/util.py": (
+                "import functools\n"
+                "\n"
+                "\n"
+                "@functools.lru_cache(maxsize=None)\n"
+                "def helper(x):\n"
+                "    return x * 2\n"
+            ),
+            "pkg/main.py": "from pkg.util import helper\n\nVALUE = helper(2)\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "pkg/util.py").splitlines()[3:5] == [
+            "@functools.lru_cache(maxsize=None)", "def double(x):",
+        ]
+        assert _read(root, "pkg/main.py") == "from pkg.util import double\n\nVALUE = double(2)\n"
+        assert _run(root, "import pkg.main; print(pkg.main.VALUE)") == "4"
+
+    def test_exception_class_in_bases_raise_and_except(self, tmp_path):
+        main = (
+            "from pkg.errors import AppError, NotFound\n"
+            "\n"
+            "\n"
+            "def run(flag):\n"
+            "    try:\n"
+            "        if flag:\n"
+            "            raise NotFound('x')\n"
+            "        raise AppError('y')\n"
+            "    except (NotFound, AppError) as exc:\n"
+            "        return type(exc).__name__\n"
+        )
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/errors.py": (
+                "class AppError(Exception):\n"
+                "    pass\n"
+                "\n"
+                "\n"
+                "class NotFound(AppError):\n"
+                "    pass\n"
+            ),
+            "pkg/main.py": main,
+        })
+        _rename_and_apply(root, "AppError", "ServiceError")
+        assert _read(root, "pkg/errors.py") == (
+            "class ServiceError(Exception):\n"
+            "    pass\n"
+            "\n"
+            "\n"
+            "class NotFound(ServiceError):\n"
+            "    pass\n"
+        )
+        assert _read(root, "pkg/main.py") == main.replace("AppError", "ServiceError")
+        assert _run(
+            root, "import pkg.main as m; print(m.run(0), m.run(1))"
+        ) == "ServiceError NotFound"
+
+    def test_class_in_annotations_generics_and_class_body(self, tmp_path):
+        main = (
+            "from __future__ import annotations\n"
+            "\n"
+            "from typing import Optional\n"
+            "\n"
+            "from pkg.util import Widget\n"
+            "\n"
+            "\n"
+            "def first(items: list[Widget], default: Optional[Widget] = None) -> Widget | None:\n"
+            "    return items[0] if items else default\n"
+            "\n"
+            "\n"
+            "class Box:\n"
+            "    item: Widget\n"
+            "\n"
+            "    def __init__(self) -> None:\n"
+            "        self.item = Widget()\n"
+        )
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/util.py": _UTIL,
+            "pkg/main.py": main,
+        })
+        _rename_and_apply(root, "Widget", "Gadget")
+        assert _read(root, "pkg/main.py") == main.replace("Widget", "Gadget")
+        assert _run(
+            root, "import pkg.main as m; print(m.first([m.Box().item]).render())"
+        ) == "w"
+
+    def test_several_edits_on_one_line_with_a_longer_name(self, tmp_path):
+        """Replacements on one line are made right to left, so a longer new
+        name cannot shift the column of the next edit."""
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/util.py": _UTIL,
+            "pkg/main.py": "from pkg.util import helper\n\nVALUE = helper(helper(1)) + helper(2)\n",
+        })
+        _rename_and_apply(root, "helper", "twice_over")
+        assert _read(root, "pkg/main.py") == (
+            "from pkg.util import twice_over\n"
+            "\n"
+            "VALUE = twice_over(twice_over(1)) + twice_over(2)\n"
+        )
+        assert _run(root, "import pkg.main; print(pkg.main.VALUE)") == "8"
+
+    def test_dry_run_shows_the_import_edit_and_writes_nothing(self, tmp_path):
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/util.py": _UTIL,
+            "pkg/main.py": "from pkg.util import helper\n\nVALUE = helper(1)\n",
+        })
+        preview = _rename(root, "helper", "double")
+        before = {rel: _read(root, rel) for rel in ("pkg/util.py", "pkg/main.py")}
+        dry = apply_refactor_func(preview["refactor_id"], repo_root=str(root), dry_run=True)
+        assert dry["status"] == "ok" and dry["edits_applied"] == 3, dry
+        assert {rel: _read(root, rel) for rel in before} == before
+        diff = next(text for path, text in dry["diffs"].items() if path.endswith("main.py"))
+        assert "-from pkg.util import helper\n" in diff
+        assert "+from pkg.util import double\n" in diff
+        # The same preview still applies after the dry run.
+        _apply(root, preview)
+        assert _run(root, "import pkg.main; print(pkg.main.VALUE)") == "2"
+
+
+def _node_run(script: Path) -> str:
+    proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+class TestMoreJavaScriptAndTypeScript:
+    @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+    def test_export_star_barrel_and_local_export_list(self, tmp_path):
+        root = _repo(tmp_path, {
+            "src/util.mjs": "function helper(x) { return x * 2; }\n\nexport { helper };\n",
+            "src/index.mjs": "export * from './util.mjs';\n",
+            "src/main.mjs": "import { helper } from './index.mjs';\nconsole.log(helper(4));\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/util.mjs") == (
+            "function double(x) { return x * 2; }\n\nexport { double };\n"
+        )
+        assert _read(root, "src/index.mjs") == "export * from './util.mjs';\n"
+        assert _read(root, "src/main.mjs") == (
+            "import { double } from './index.mjs';\nconsole.log(double(4));\n"
+        )
+        assert _node_run(root / "src" / "main.mjs") == "8"
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+    def test_default_export_object_keeps_its_key(self, tmp_path):
+        root = _repo(tmp_path, {
+            "src/util.mjs": "function helper(x) { return x * 2; }\nexport default { helper };\n",
+            "src/main.mjs": "import utils from './util.mjs';\nconsole.log(utils.helper(4));\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/util.mjs") == (
+            "function double(x) { return x * 2; }\nexport default { helper: double };\n"
+        )
+        assert _read(root, "src/main.mjs") == (
+            "import utils from './util.mjs';\nconsole.log(utils.helper(4));\n"
+        )
+        assert _node_run(root / "src" / "main.mjs") == "8"
+
+    def test_exported_arrow_function_const(self, tmp_path):
+        root = _repo(tmp_path, {
+            "src/util.ts": "export const helper = (x: number): number => x * 2;\n",
+            "src/main.ts": "import { helper } from './util';\n\nexport const v = helper(3);\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/util.ts") == (
+            "export const double = (x: number): number => x * 2;\n"
+        )
+        assert _read(root, "src/main.ts") == (
+            "import { double } from './util';\n\nexport const v = double(3);\n"
+        )
+
+    def test_tsx_component_in_opening_and_closing_tags(self, tmp_path):
+        app = (
+            "import { Button } from './Button';\n"
+            "\n"
+            "export function App() {\n"
+            "  return (\n"
+            "    <div>\n"
+            "      <Button label=\"a\" />\n"
+            "      <Button label=\"b\"></Button>\n"
+            "    </div>\n"
+            "  );\n"
+            "}\n"
+        )
+        root = _repo(tmp_path, {
+            "src/Button.tsx": (
+                "export function Button(props: { label: string }) {\n"
+                "  return <button>{props.label}</button>;\n"
+                "}\n"
+            ),
+            "src/App.tsx": app,
+        })
+        _rename_and_apply(root, "Button", "ActionButton")
+        # The module path './Button' is a string and keeps its spelling.
+        assert _read(root, "src/App.tsx") == (
+            app.replace("Button", "ActionButton").replace("'./ActionButton'", "'./Button'")
+        )
+        assert _read(root, "src/Button.tsx").startswith("export function ActionButton(props")
+        # The intrinsic <button> element is not the component.
+        assert "<button>{props.label}</button>" in _read(root, "src/Button.tsx")
+
+    def test_type_only_import_and_type_only_barrel(self, tmp_path):
+        main = (
+            "import type { WidgetProps } from './index';\n"
+            "\n"
+            "export function title(p: WidgetProps): string {\n"
+            "  return p.title;\n"
+            "}\n"
+        )
+        root = _repo(tmp_path, {
+            "src/types.ts": "export interface WidgetProps { title: string }\n",
+            "src/index.ts": "export type { WidgetProps } from './types';\n",
+            "src/main.ts": main,
+        })
+        _rename_and_apply(root, "WidgetProps", "GadgetProps")
+        assert _read(root, "src/types.ts") == "export interface GadgetProps { title: string }\n"
+        assert _read(root, "src/index.ts") == "export type { GadgetProps } from './types';\n"
+        assert _read(root, "src/main.ts") == main.replace("WidgetProps", "GadgetProps")
+
+    def test_tsconfig_path_alias_js_extension_and_directory_index(self, tmp_path):
+        root = _repo(tmp_path, {
+            "tsconfig.json": (
+                '{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"]}}}\n'
+            ),
+            "src/lib/util.ts": (
+                "export function helper(x: number): number {\n  return x * 2;\n}\n"
+            ),
+            "src/lib/index.ts": "export { helper } from './util';\n",
+            "src/alias.ts": "import { helper } from '@/lib/util';\n\nexport const a = helper(1);\n",
+            "src/esm.ts": (
+                "import { helper } from './lib/util.js';\n\nexport const b = helper(2);\n"
+            ),
+            "src/dir.ts": "import { helper } from './lib';\n\nexport const c = helper(3);\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/lib/index.ts") == "export { double } from './util';\n"
+        assert _read(root, "src/alias.ts") == (
+            "import { double } from '@/lib/util';\n\nexport const a = double(1);\n"
+        )
+        assert _read(root, "src/esm.ts") == (
+            "import { double } from './lib/util.js';\n\nexport const b = double(2);\n"
+        )
+        assert _read(root, "src/dir.ts") == (
+            "import { double } from './lib';\n\nexport const c = double(3);\n"
+        )
+
+    def test_class_in_extends_new_and_type_position(self, tmp_path):
+        root = _repo(tmp_path, {
+            "src/base.ts": (
+                "export interface Shape { area(): number }\n"
+                "export class Base implements Shape {\n"
+                "  area(): number { return 1; }\n"
+                "}\n"
+            ),
+            "src/main.ts": (
+                "import { Base, Shape } from './base';\n"
+                "\n"
+                "export class Square extends Base implements Shape {}\n"
+                "export const s: Base = new Base();\n"
+            ),
+        })
+        _rename_and_apply(root, "Base", "BaseShape")
+        assert _read(root, "src/main.ts") == (
+            "import { BaseShape, Shape } from './base';\n"
+            "\n"
+            "export class Square extends BaseShape implements Shape {}\n"
+            "export const s: BaseShape = new BaseShape();\n"
+        )
+        assert _read(root, "src/base.ts").splitlines()[1] == (
+            "export class BaseShape implements Shape {"
+        )
+
+
+class TestCallsThroughAPackageAttribute:
+    """Calls no import statement spells: ``pkg.util.helper()`` after
+    ``import pkg``, ``sub.util.helper()`` after ``from pkg import sub``, and
+    a module bound by ``importlib``. Only the graph's call edge finds them,
+    so a rename must still use it."""
+
+    def test_import_package_then_submodule_attribute(self, tmp_path):
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "from . import util\n",
+            "pkg/util.py": _UTIL,
+            "pkg/main.py": "import pkg\n\n\ndef main():\n    return pkg.util.helper(3)\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "pkg/main.py") == (
+            "import pkg\n\n\ndef main():\n    return pkg.util.double(3)\n"
+        )
+        assert _run(root, "import pkg.main; print(pkg.main.main())") == "6"
+
+    def test_from_package_import_subpackage_then_attribute_chain(self, tmp_path):
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/sub/__init__.py": "from . import util\n",
+            "pkg/sub/util.py": _UTIL,
+            "pkg/main.py": "from pkg import sub\n\n\ndef main():\n    return sub.util.helper(3)\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "pkg/main.py") == (
+            "from pkg import sub\n\n\ndef main():\n    return sub.util.double(3)\n"
+        )
+        assert _run(root, "import pkg.main; print(pkg.main.main())") == "6"
+
+    def test_module_bound_by_importlib(self, tmp_path):
+        main = (
+            "import importlib\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    util = importlib.import_module('pkg.util')\n"
+            "    return util.helper(21)\n"
+        )
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/util.py": _UTIL,
+            "pkg/main.py": main,
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "pkg/main.py") == main.replace("util.helper(21)", "util.double(21)")
+        assert _run(root, "import pkg.main; print(pkg.main.main())") == "42"
+
+
+class TestJsNamespaceObjectsTheScanDoesNotLink:
+    """``ns.helper`` through a namespace the scan cannot tie to the home
+    module by itself: ``import * as`` of an ``export *`` barrel, a dynamic
+    ``import()``, and TypeScript's ``import x = require()``."""
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+    def test_namespace_import_of_an_export_star_barrel(self, tmp_path):
+        root = _repo(tmp_path, {
+            "src/util.mjs": "export function helper(x) { return x * 2; }\n",
+            "src/index.mjs": "export * from './util.mjs';\n",
+            "src/main.mjs": "import * as lib from './index.mjs';\nconsole.log(lib.helper(4));\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/main.mjs") == (
+            "import * as lib from './index.mjs';\nconsole.log(lib.double(4));\n"
+        )
+        assert _node_run(root / "src" / "main.mjs") == "8"
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+    def test_dynamic_import_namespace(self, tmp_path):
+        main = (
+            "async function run() {\n"
+            "  const m = await import('./util.mjs');\n"
+            "  return m.helper(4);\n"
+            "}\n"
+            "run().then((v) => console.log(v));\n"
+        )
+        root = _repo(tmp_path, {
+            "src/util.mjs": "export function helper(x) { return x * 2; }\n",
+            "src/main.mjs": main,
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/main.mjs") == main.replace("m.helper(4)", "m.double(4)")
+        assert _node_run(root / "src" / "main.mjs") == "8"
+
+    def test_typescript_import_equals_require(self, tmp_path):
+        main = "import U = require('./util');\n\nexport const v = U.helper(1);\n"
+        root = _repo(tmp_path, {
+            "src/util.ts": "export function helper(x: number): number {\n  return x * 2;\n}\n",
+            "src/main.ts": main,
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/util.ts").startswith("export function double(")
+        assert _read(root, "src/main.ts") == main.replace("U.helper(1)", "U.double(1)")
+
+
+class TestJsDefinitionWithSameNamedInnerDeclaration:
+    """The definition edit lands on the symbol, not on a later declaration
+    of the same name inside it (a local, or a named function expression)."""
+
+    def test_function_with_a_same_named_local(self, tmp_path):
+        root = _repo(tmp_path, {
+            "src/app.js": (
+                "function settings() {\n"
+                "  const settings = { a: 1 };\n"
+                "  return settings;\n"
+                "}\n"
+                "\n"
+                "console.log(settings().a);\n"
+            ),
+        })
+        _rename_and_apply(root, "settings", "config")
+        assert _read(root, "src/app.js") == (
+            "function config() {\n"
+            "  const settings = { a: 1 };\n"
+            "  return settings;\n"
+            "}\n"
+            "\n"
+            "console.log(config().a);\n"
+        )
+
+    def test_named_function_expression(self, tmp_path):
+        root = _repo(tmp_path, {
+            "src/u.js": (
+                "const helper = function helper(n) {\n"
+                "  return n * 2;\n"
+                "};\n"
+                "console.log(helper(2));\n"
+            ),
+        })
+        _rename_and_apply(root, "helper", "double")
+        text = _read(root, "src/u.js")
+        assert text.startswith("const double = function"), text
+        assert "console.log(double(2));" in text, text
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+    def test_importer_still_runs_under_node(self, tmp_path):
+        root = _repo(tmp_path, {
+            "src/util.mjs": (
+                "export function settings() {\n"
+                "  const settings = { a: 1 };\n"
+                "  return settings;\n"
+                "}\n"
+            ),
+            "src/main.mjs": (
+                "import { settings } from './util.mjs';\n"
+                "console.log(settings().a);\n"
+            ),
+        })
+        _rename_and_apply(root, "settings", "config")
+        assert _read(root, "src/util.mjs").startswith("export function config() {\n")
+        assert _read(root, "src/main.mjs") == (
+            "import { config } from './util.mjs';\nconsole.log(config().a);\n"
+        )
+        assert _node_run(root / "src" / "main.mjs") == "1"
+
+
+_SHELL_SCRIPT = (
+    "#!/usr/bin/env bash\n"
+    "set -euo pipefail\n"
+    "\n"
+    "get_version() {\n"
+    "  echo \"1.2.3\"\n"
+    "}\n"
+    "\n"
+    "main() {\n"
+    "  local v\n"
+    "  v=\"$(get_version)\"\n"
+    "  echo \"version $v\"\n"
+    "}\n"
+    "\n"
+    "main\n"
+)
+
+
+class TestShellCommandSubstitution:
+    def test_call_inside_quoted_command_substitution_is_renamed(self, tmp_path):
+        """``v="$(get_version)"`` is code inside a string node; the call in
+        it is renamed, while plain string text is not."""
+        root = _repo(tmp_path, {"build.sh": _SHELL_SCRIPT})
+        _rename_and_apply(root, "get_version", "read_version")
+        assert _read(root, "build.sh") == _SHELL_SCRIPT.replace("get_version", "read_version")
+        if shutil.which("bash"):
+            proc = subprocess.run(
+                ["bash", str(root / "build.sh")], capture_output=True, text=True, timeout=60,
+            )
+            assert proc.returncode == 0, proc.stderr
+            assert proc.stdout.strip() == "version 1.2.3"
+
+
+class TestBarrelsWithoutANamedImportConsumer:
+    """``export { name } from`` carries no graph edge; a barrel must still
+    be found when no file imports the name from it by name."""
+
+    def test_public_barrel_with_no_consumer_in_the_repo(self, tmp_path):
+        root = _repo(tmp_path, {
+            "src/util.ts": "export function helper(x: number): number {\n  return x * 2;\n}\n",
+            "src/index.ts": "export { helper } from './util';\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/util.ts").startswith("export function double(")
+        assert _read(root, "src/index.ts") == "export { double } from './util';\n"
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+    def test_named_barrel_reached_only_through_a_namespace_import(self, tmp_path):
+        root = _repo(tmp_path, {
+            "src/util.mjs": "export function helper(x) { return x * 2; }\n",
+            "src/index.mjs": "export { helper } from './util.mjs';\n",
+            "src/main.mjs": "import * as lib from './index.mjs';\nconsole.log(lib.helper(4));\n",
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/index.mjs") == "export { double } from './util.mjs';\n"
+        assert _read(root, "src/main.mjs") == (
+            "import * as lib from './index.mjs';\nconsole.log(lib.double(4));\n"
+        )
+        assert _node_run(root / "src" / "main.mjs") == "8"
+
+
+class TestCallEdgesAreResolvedNotGuessed:
+    """A call edge to the bare name is read through the calling module's
+    imports, so it finds ``pkg.util.name()`` without renaming every
+    ``obj.name()`` that happens to share the name."""
+
+    def test_unrelated_attribute_calls_keep_a_common_name(self, tmp_path):
+        worker = (
+            "import threading\n"
+            "\n"
+            "\n"
+            "class Worker:\n"
+            "    def run(self):\n"
+            "        return 'worker'\n"
+            "\n"
+            "    def go(self):\n"
+            "        thread = threading.Thread(target=print)\n"
+            "        thread.run()\n"
+            "        return self.run()\n"
+        )
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "",
+            "pkg/util.py": "def run(x):\n    return x * 2\n",
+            "pkg/worker.py": worker,
+        })
+        preview = _rename_and_apply(root, "pkg/util.py::run", "double")
+        assert {Path(e["file"]).name for e in preview["edits"]} == {"util.py"}
+        assert _read(root, "pkg/worker.py") == worker
+        assert _run(root, "from pkg.worker import Worker; print(Worker().go())") == "worker"
+
+    def test_attribute_chains_resolve_to_their_own_module(self, tmp_path):
+        app = (
+            "from pkg.util import helper as h\n"
+            "import pkg\n"
+            "from pkg import sub\n"
+            "import pkg.sub.tool\n"
+            "\n"
+            "\n"
+            "def run():\n"
+            "    return h(1), pkg.util.helper(2), sub.tool.helper(3), pkg.sub.tool.helper(4)\n"
+        )
+        root = _repo(tmp_path, {
+            "pkg/__init__.py": "from . import util\n",
+            "pkg/util.py": "def helper(x):\n    return x * 2\n",
+            "pkg/sub/__init__.py": "from . import tool\n",
+            "pkg/sub/tool.py": "def helper(x):\n    return x + 100\n",
+            "app.py": app,
+        })
+        _rename_and_apply(root, "pkg/util.py::helper", "double")
+        assert _read(root, "app.py") == (
+            app.replace("import helper as h", "import double as h")
+            .replace("pkg.util.helper(2)", "pkg.util.double(2)")
+        )
+        _build(root)
+        _rename_and_apply(root, "pkg/sub/tool.py::helper", "plus")
+        assert _read(root, "app.py").splitlines()[-1] == (
+            "    return h(1), pkg.util.double(2), sub.tool.plus(3), pkg.sub.tool.plus(4)"
+        )
+        assert _run(root, "import app; print(app.run())") == "(2, 4, 103, 104)"
+
+
+class TestJsNamespaceObjectsInDepth:
+    @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+    def test_scoped_dynamic_imports_then_callbacks_and_barrel_chains(self, tmp_path):
+        main = (
+            "import { helper, h } from './index.mjs';\n"
+            "import * as all from './index.mjs';\n"
+            "async function a() {\n"
+            "  const m = await import('./util.mjs');\n"
+            "  return m.helper(1);\n"
+            "}\n"
+            "function b() {\n"
+            "  const m = { helper: (x) => x };\n"
+            "  return m.helper(2);\n"
+            "}\n"
+            "const t = await import('./util.mjs').then((q) => q.helper(3));\n"
+            "console.log(helper(4), h(5), all.helper(6), await a(), b(), t);\n"
+        )
+        root = _repo(tmp_path, {
+            "src/util.mjs": "export function helper(x) { return x * 2; }\n",
+            "src/lib/index.mjs": (
+                "export { helper } from '../util.mjs';\n"
+                "export { helper as h } from '../util.mjs';\n"
+            ),
+            "src/index.mjs": "export * from './lib/index.mjs';\n",
+            "src/main.mjs": main,
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "src/lib/index.mjs") == (
+            "export { double } from '../util.mjs';\n"
+            "export { double as h } from '../util.mjs';\n"
+        )
+        assert _read(root, "src/index.mjs") == "export * from './lib/index.mjs';\n"
+        assert _read(root, "src/main.mjs") == (
+            main.replace("import { helper, h }", "import { double, h }")
+            .replace("m.helper(1)", "m.double(1)")
+            .replace("q.helper(3)", "q.double(3)")
+            .replace("console.log(helper(4), h(5), all.helper(6)",
+                     "console.log(double(4), h(5), all.double(6)")
+        )
+        assert _node_run(root / "src" / "main.mjs") == "8 10 12 2 2 6"
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+    def test_commonjs_exports_keep_their_key_for_every_consumer(self, tmp_path):
+        """``module.exports = { helper }`` becomes ``{ helper: double }``, so
+        a namespace import, a named import, a dynamic import, a ``require``
+        and a barrel all keep spelling ``helper``."""
+        consumers = {
+            "cjs/main.mjs": (
+                "import * as ns from './util.js';\n"
+                "import { helper } from './util.js';\n"
+                "import { helper as viaBarrel } from './barrel.mjs';\n"
+                "const m = await import('./util.js');\n"
+                "console.log(ns.helper(1), helper(2), m.helper(3), viaBarrel(4));\n"
+            ),
+            "cjs/barrel.mjs": "export { helper } from './util.js';\n",
+            "cjs/c.js": "const u = require('./util');\nconsole.log(u.helper(5));\n",
+        }
+        root = _repo(tmp_path, {
+            "cjs/util.js": "function helper(x) { return x * 2; }\nmodule.exports = { helper };\n",
+            **consumers,
+        })
+        _rename_and_apply(root, "helper", "double")
+        assert _read(root, "cjs/util.js") == (
+            "function double(x) { return x * 2; }\nmodule.exports = { helper: double };\n"
+        )
+        assert {rel: _read(root, rel) for rel in consumers} == consumers
+        assert _node_run(root / "cjs" / "main.mjs") == "2 4 6 8"
+        assert _node_run(root / "cjs" / "c.js") == "10"
+
+
+class TestShellStringsStayText:
+    def test_plain_string_text_before_the_call_is_not_edited(self, tmp_path):
+        script = (
+            "get_version() {\n"
+            "  echo \"1.2.3\"\n"
+            "}\n"
+            "\n"
+            "echo \"get_version says $(get_version)\"\n"
+        )
+        root = _repo(tmp_path, {"run.sh": script})
+        _rename_and_apply(root, "get_version", "read_version")
+        assert _read(root, "run.sh") == (
+            script.replace("get_version() {", "read_version() {")
+            .replace("$(get_version)", "$(read_version)")
         )
