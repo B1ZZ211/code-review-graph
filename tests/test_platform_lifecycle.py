@@ -876,6 +876,37 @@ def test_step4b_uninstall_leaves_no_file_still_holding_our_content(
     _record("step4b_content_leftovers", key, len(created))
 
 
+def test_step4b_qoder_uninstall_removes_every_skill_file_install_wrote(
+    sandbox: Sandbox,
+) -> None:
+    """Every ``.qoder/skills`` file install wrote is gone after uninstall.
+
+    Step 4b only flags a leftover that still contains the string
+    ``code-review-graph``, and most bundled ``SKILL.md`` files never say it,
+    so an uninstall that dropped some of the bundled names would still pass
+    there. This compares by path against what install actually wrote, in a
+    repository with no ``skills/`` directory of its own (#909).
+    """
+    skills_root = sandbox.repo / ".qoder" / "skills"
+    assert not (sandbox.repo / "skills").exists()
+    before = snapshot(sandbox)
+    run_install(sandbox, "qoder")
+    written = sorted(
+        path for path in set(snapshot(sandbox)) - set(before) if skills_root in path.parents
+    )
+    installed = {path.relative_to(skills_root).parts[0] for path in written}
+    assert installed == set(skills.bundled_skill_names()), (
+        f"qoder: install wrote {sorted(installed)}, bundled are {skills.bundled_skill_names()}"
+    )
+
+    report = run_uninstall(sandbox)
+    after = snapshot(sandbox)
+
+    left = [str(path) for path in written if path in after]
+    assert not left, f"qoder: uninstall left skill files behind: {left}"
+    assert not report.errors, f"qoder: uninstall reported errors {report.errors}"
+
+
 @pytest.mark.parametrize(
     "key",
     [pytest.param(k, marks=[pytest.mark.xfail(strict=True, reason=HUSK_XFAIL)])
