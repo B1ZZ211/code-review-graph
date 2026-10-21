@@ -760,9 +760,9 @@ def test_impact_accuracy_emits_both_ground_truth_modes():
     assert len(co_rows) == 1
     co = co_rows[0]
     assert co["status"] == "ok"
-    # The seed is reported in the stored (absolute) path form the predictor
-    # consumed, so match on the basename.
-    assert Path(co["seed_file"]).name == "helper.py"
+    # The seed is reported relative to the repo root, never as the local
+    # clone path (the predictor itself still gets the stored absolute form).
+    assert co["seed_file"] == "helper.py"
     assert co["actual_files"] == 1
     # Regression guard: the predictor must emit real candidates. main.py
     # imports helper.py, so the CALLS/IMPORTS_FROM edge has to be found even
@@ -793,6 +793,9 @@ def test_impact_accuracy_co_change_skipped_for_single_file_commit():
     assert len(co_rows) == 1
     assert co_rows[0]["status"] == "skipped"
     assert "co-changed" in co_rows[0]["error"]
+    # Skipped rows also report the seed relative to the repo root.
+    assert not Path(co_rows[0]["seed_file"]).is_absolute()
+    assert str(Path(tmpdir)) not in co_rows[0]["seed_file"]
 
     agg = impact_accuracy.aggregate(results)
     assert agg["skipped_rows"] == 1

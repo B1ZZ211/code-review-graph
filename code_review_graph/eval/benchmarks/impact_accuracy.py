@@ -155,7 +155,10 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
         # paths never matched a node, so co-change predictions were always
         # empty and the graph-derived ground truth never included real
         # neighbours (recall pinned at 1.0 by construction, not by intent).
-        changed_abs = {str(normalize_file_path(root / f)) for f in changed}
+        # Keep the repo-relative form too: result rows (``seed_file``) must
+        # not leak the local clone location into the published CSVs.
+        rel_of = {normalize_file_path(root / f): normalize_file_path(f) for f in changed}
+        changed_abs = set(rel_of)
 
         # --- Mode 1: graph-derived ground truth (circular — upper bound) ---
         try:
@@ -184,9 +187,10 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
         # seed file, never the full commit diff. The seed path is passed in
         # the stored absolute form so the fallback node lookup matches.
         seed = sorted(changed_abs)[0]
+        seed_rel = rel_of[seed]
         co_actual = changed_abs - {seed}
         if not co_actual:
-            row = _base_row(repo, sha, MODE_CO_CHANGE, seed)
+            row = _base_row(repo, sha, MODE_CO_CHANGE, seed_rel)
             row["status"] = "skipped"
             row["error"] = "single-file commit: no co-changed files to grade against"
             results.append(row)
@@ -196,14 +200,14 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
             seed_analysis = analyze_changes(store, [seed])
         except Exception as exc:
             logger.warning("analyze_changes (seed=%s) failed on %s: %s", seed, sha, exc)
-            results.append(_error_row(repo, sha, MODE_CO_CHANGE, seed, exc))
+            results.append(_error_row(repo, sha, MODE_CO_CHANGE, seed_rel, exc))
             continue
 
         co_predicted = _files_from_analysis(seed_analysis)
         co_predicted |= _graph_neighbor_files(store, [seed])
         co_predicted.discard(seed)
         results.append(
-            _scored_row(repo, sha, MODE_CO_CHANGE, seed, co_predicted, co_actual)
+            _scored_row(repo, sha, MODE_CO_CHANGE, seed_rel, co_predicted, co_actual)
         )
 
     return results

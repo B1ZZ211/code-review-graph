@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from .parser import CodeParser, EdgeInfo, normalize_file_path
 from .parser import _is_test_file as _parser_is_test_file
@@ -24,12 +24,21 @@ logger = logging.getLogger(__name__)
 _SELF_NAMES = frozenset({"self", "cls", "super"})
 
 
-def enrich_jedi_calls(store, repo_root: Path) -> dict:
+def enrich_jedi_calls(
+    store, repo_root: Path, files: Optional[Iterable[str]] = None,
+) -> dict:
     """Resolve untracked Python method calls via Jedi.
 
     Walks Python files, finds ``receiver.method()`` calls that tree-sitter
     dropped (lowercase receiver, not self/cls), resolves them with Jedi,
     and inserts new CALLS edges.
+
+    *files* limits which files are read and scanned for calls. ``None``
+    (a full build) scans every Python file in the graph. An incremental
+    update passes only the files it re-parsed: re-parsing replaces a file's
+    edges, so those are the only files that lost their Jedi edges, and
+    reading every other Python file again on each update is wasted work.
+    Jedi still resolves call targets across the whole project.
 
     Returns stats dict with ``resolved`` count.
     """
@@ -48,6 +57,16 @@ def enrich_jedi_calls(store, repo_root: Path) -> dict:
 
     if not py_files:
         return {"resolved": 0, "files": 0}
+
+    # Files to read and scan. The Jedi project below is still built from
+    # every Python file so that targets in unchanged files resolve.
+    if files is None:
+        scan_files = py_files
+    else:
+        wanted = {normalize_file_path(f) for f in files}
+        scan_files = [f for f in py_files if normalize_file_path(f) in wanted]
+        if not scan_files:
+            return {"resolved": 0, "files": 0}
 
     # Scope the Jedi project to Python-only directories to avoid scanning
     # non-Python files (e.g. node_modules, TS sources).  This matters for
@@ -82,13 +101,13 @@ def enrich_jedi_calls(store, repo_root: Path) -> dict:
 
     files_with_pending: list[tuple[str, bytes, list]] = []
     total_skipped = 0
-    for file_path in py_files:
+    for file_path in scan_files:
         try:
             source = Path(file_path).read_bytes()
         except (OSError, PermissionError):
             continue
         tree = ts_parser.parse(source)
-        is_test = _parser_is_test_file(file_path)
+        is_test = _parser_is_test_file(file_path, repo_root)
         pending = _find_untracked_method_calls(tree.root_node, is_test)
         if pending:
             # Only keep calls whose method name exists in project code
@@ -102,7 +121,7 @@ def enrich_jedi_calls(store, repo_root: Path) -> dict:
 
     logger.debug(
         "Jedi: %d/%d Python files have pending calls (%d calls skipped — no project target)",
-        len(files_with_pending), len(py_files), total_skipped,
+        len(files_with_pending), len(scan_files), total_skipped,
     )
 
     resolved_count = 0
